@@ -1,4 +1,4 @@
-# CS324-A1
+# CS324-A2
 
 Java RMI cluster that runs distributed jobs across worker nodes under an elected coordinator.
 
@@ -20,15 +20,15 @@ Use a separate terminal for each process.
 1. Bootstrap node (directory service, default port 1099):
 
 ```bat
-java -cp target\classes com.cs324a1.bootstrap.BootstrapNode 1099
+java -cp target/classes com.cs324a2.bootstrap.BootstrapNode 1099
 ```
 
 2. Workers (each needs a unique integer ID):
 
 ```bat
-java -cp target\classes com.cs324a1.worker.WorkerNode 1 localhost 1099
-java -cp target\classes com.cs324a1.worker.WorkerNode 2 localhost 1099
-java -cp target\classes com.cs324a1.worker.WorkerNode 3 localhost 1099
+java -cp target/classes com.cs324a2.worker.WorkerNode 1 localhost 1099
+java -cp target/classes com.cs324a2.worker.WorkerNode 2 localhost 1099
+java -cp target/classes com.cs324a2.worker.WorkerNode 3 localhost 1099
 ```
 
 New workers register with the bootstrap and connect to one random active worker. Leave them running.
@@ -36,7 +36,7 @@ New workers register with the bootstrap and connect to one random active worker.
 3. Client GUI (run one or more instances):
 
 ```bat
-java -cp target\classes com.cs324a1.client.ClientApp
+java -cp target/classes com.cs324a2.client.ClientApp
 ```
 
 ## Using the client
