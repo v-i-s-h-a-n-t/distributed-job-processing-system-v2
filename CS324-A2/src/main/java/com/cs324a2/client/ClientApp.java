@@ -24,6 +24,7 @@ import java.util.List;
 import java.util.UUID;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
+import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicInteger;
 import javax.swing.BorderFactory;
 import javax.swing.Box;
@@ -94,6 +95,7 @@ public class ClientApp extends JFrame {
     private final JPanel numbersCard = new JPanel(new BorderLayout());
     private final JPanel rangeCard = new JPanel(new FlowLayout(FlowLayout.LEFT, 8, 0));
     private final JLabel inputLabel = new JLabel();
+    private final JLabel jobDescriptionLabel = new JLabel();
 
     private final DefaultTableModel tableModel = new DefaultTableModel(
             new Object[]{"Job", "Operation", "Input", "Status", "Result"}, 0) {
@@ -110,6 +112,7 @@ public class ClientApp extends JFrame {
     private final ExecutorService submitPool = Executors.newFixedThreadPool(8);
     private final AtomicInteger jobCounter = new AtomicInteger(0);
     private final AtomicInteger running = new AtomicInteger(0);
+    private final AtomicBoolean workerPollInProgress = new AtomicBoolean(false);
     private Timer workerPollTimer;
 
     public ClientApp() {
@@ -123,8 +126,8 @@ public class ClientApp extends JFrame {
         operationBox.addActionListener(e -> updateInputs());
         updateInputs();
 
-        setMinimumSize(new Dimension(1200, 800));
-        setSize(1360, 920);
+        setMinimumSize(new Dimension(980, 700));
+        setSize(1180, 820);
         setLocationRelativeTo(null);
         startWorkerPolling();
     }
@@ -153,9 +156,9 @@ public class ClientApp extends JFrame {
         portField.setPreferredSize(new Dimension(10, FIELD_H));
 
         styleSpinner(startField);
-        startField.setPreferredSize(new Dimension(180, FIELD_H));
+        startField.setPreferredSize(new Dimension(230, FIELD_H));
         styleSpinner(endField);
-        endField.setPreferredSize(new Dimension(180, FIELD_H));
+        endField.setPreferredSize(new Dimension(230, FIELD_H));
 
         operationBox.setFont(bodyFont);
         operationBox.setBackground(SURFACE);
@@ -193,6 +196,8 @@ public class ClientApp extends JFrame {
 
         inputLabel.setFont(boldFont);
         inputLabel.setForeground(TEXT);
+        jobDescriptionLabel.setFont(bodyFont);
+        jobDescriptionLabel.setForeground(MUTED);
 
         statusLabel.setFont(bodyFont);
         statusLabel.setForeground(MUTED);
@@ -310,9 +315,21 @@ public class ClientApp extends JFrame {
         JLabel title = new JLabel("CS324-A2 Client");
         title.setFont(titleFont);
         title.setForeground(TEXT);
+        JLabel subtitle = new JLabel("Distributed compute workspace");
+        subtitle.setFont(bodyFont);
+        subtitle.setForeground(MUTED);
+        JPanel titleGroup = new JPanel();
+        titleGroup.setLayout(new BoxLayout(titleGroup, BoxLayout.Y_AXIS));
+        titleGroup.setOpaque(false);
+        titleGroup.add(title);
+        titleGroup.add(Box.createVerticalStrut(3));
+        titleGroup.add(subtitle);
 
         statusLabel.setHorizontalAlignment(SwingConstants.RIGHT);
-        header.add(title, BorderLayout.WEST);
+        statusLabel.setBorder(BorderFactory.createCompoundBorder(
+                BorderFactory.createLineBorder(LINE, 1, true),
+                BorderFactory.createEmptyBorder(8, 12, 8, 12)));
+        header.add(titleGroup, BorderLayout.WEST);
         header.add(statusLabel, BorderLayout.EAST);
         return header;
     }
@@ -374,6 +391,9 @@ public class ClientApp extends JFrame {
         inputLabel.setAlignmentX(LEFT_ALIGNMENT);
         panel.add(inputLabel);
         panel.add(Box.createVerticalStrut(6));
+        jobDescriptionLabel.setAlignmentX(LEFT_ALIGNMENT);
+        panel.add(jobDescriptionLabel);
+        panel.add(Box.createVerticalStrut(8));
 
         inputPanel.setAlignmentX(LEFT_ALIGNMENT);
         inputPanel.setMaximumSize(new Dimension(Integer.MAX_VALUE, 170));
@@ -390,7 +410,7 @@ public class ClientApp extends JFrame {
         JPanel head = new JPanel(new BorderLayout());
         head.setOpaque(false);
         head.setBackground(SURFACE);
-        head.add(section("RESULTS"), BorderLayout.WEST);
+        head.add(section("JOB HISTORY"), BorderLayout.WEST);
         runningLabel.setHorizontalAlignment(SwingConstants.RIGHT);
         head.add(runningLabel, BorderLayout.EAST);
         panel.add(head, BorderLayout.NORTH);
@@ -431,6 +451,11 @@ public class ClientApp extends JFrame {
         ComputeOperation op = (ComputeOperation) operationBox.getSelectedItem();
         boolean isRange = op == ComputeOperation.PRIMESUM;
         inputLabel.setText(isRange ? "Range" : "Numbers");
+        jobDescriptionLabel.setText(switch (op) {
+            case MAX -> "Enter integers separated by commas, spaces, or new lines. Returns the largest value.";
+            case PRIMECOUNT -> "Enter integers to count. Duplicate prime values are counted separately.";
+            case PRIMESUM -> "Choose an inclusive start and end. Large ranges can take longer to finish.";
+        });
         inputLayout.show(inputPanel, isRange ? "range" : "numbers");
     }
 
@@ -442,26 +467,41 @@ public class ClientApp extends JFrame {
     }
 
     private void refreshWorkerCount() {
-        submitPool.submit(() -> {
-            try {
-                List<String> workers = service().activeWorkerAddresses();
-                int n = workers.size();
-                SwingUtilities.invokeLater(() -> {
-                    statusLabel.setText(n + (n == 1 ? " worker online" : " workers online"));
-                    statusLabel.setForeground(n > 0 ? GREEN : MUTED);
-                });
-            } catch (Exception ex) {
-                SwingUtilities.invokeLater(() -> {
-                    statusLabel.setText("0 workers online");
-                    statusLabel.setForeground(RED);
-                });
-            }
-        });
+        if (!workerPollInProgress.compareAndSet(false, true)) return;
+        try {
+            submitPool.submit(() -> {
+                try {
+                    List<String> workers = service().activeWorkerAddresses();
+                    int n = workers.size();
+                    SwingUtilities.invokeLater(() -> {
+                        statusLabel.setText("●  " + n
+                                + (n == 1 ? " worker online" : " workers online"));
+                        statusLabel.setForeground(n > 0 ? GREEN : MUTED);
+                        statusLabel.setBackground(n > 0
+                                ? new Color(0xF0FDF4) : new Color(0xF8FAFC));
+                        statusLabel.setOpaque(true);
+                    });
+                } catch (Exception ex) {
+                    SwingUtilities.invokeLater(() -> {
+                        statusLabel.setText("●  Disconnected");
+                        statusLabel.setForeground(RED);
+                        statusLabel.setBackground(new Color(0xFEF2F2));
+                        statusLabel.setOpaque(true);
+                    });
+                } finally {
+                    workerPollInProgress.set(false);
+                }
+            });
+        } catch (java.util.concurrent.RejectedExecutionException ignored) {
+            workerPollInProgress.set(false);
+        }
     }
 
     private void updateRunning() {
         int n = running.get();
-        SwingUtilities.invokeLater(() -> runningLabel.setText(n + " running"));
+        int total = tableModel.getRowCount();
+        SwingUtilities.invokeLater(() -> runningLabel.setText(
+                n + " running  ·  " + total + " jobs"));
     }
 
     private ClientService service() {
@@ -514,7 +554,7 @@ public class ClientApp extends JFrame {
                 inputSummary = summarize(numbers);
             }
         } catch (IllegalArgumentException e) {
-            JOptionPane.showMessageDialog(this, "Check the input values and try again.",
+            JOptionPane.showMessageDialog(this, e.getMessage(),
                     "Invalid input", JOptionPane.ERROR_MESSAGE);
             return;
         }
@@ -543,7 +583,10 @@ public class ClientApp extends JFrame {
                     long result = get();
                     updateRow(row, "DONE", String.valueOf(result));
                 } catch (Exception e) {
-                    updateRow(row, "FAILED", "");
+                    Throwable cause = e;
+                    while (cause.getCause() != null) cause = cause.getCause();
+                    updateRow(row, "FAILED", cause.getMessage() == null
+                            ? cause.getClass().getSimpleName() : cause.getMessage());
                 }
             }
         }.execute();
@@ -558,7 +601,7 @@ public class ClientApp extends JFrame {
 
     private int addRow(String jobId, ComputeOperation op, String input) {
         int row = tableModel.getRowCount();
-        SwingUtilities.invokeLater(() -> tableModel.addRow(new Object[]{jobId, op, input, "RUNNING", ""}));
+        tableModel.addRow(new Object[]{jobId, op, input, "RUNNING", ""});
         return row;
     }
 
