@@ -82,7 +82,7 @@ public final class JobParser {
     }
 
     /** Loads a PRIMESUM range. Accepts "start,end" (single row, header optional). */
-    public static int[] loadPrimeSumRange(File file) throws IOException {
+    public static long[] loadPrimeSumRange(File file) throws IOException {
         try (BufferedReader reader = new BufferedReader(new FileReader(file))) {
             String line;
             while ((line = reader.readLine()) != null) {
@@ -98,12 +98,12 @@ public final class JobParser {
                     throw new IOException("expected 'start,end' in " + file.getName() + " but got: " + line);
                 }
                 try {
-                    int start = Integer.parseInt(tokens[0].trim());
-                    int end = Integer.parseInt(tokens[1].trim());
+                    long start = Long.parseLong(tokens[0].trim());
+                    long end = Long.parseLong(tokens[1].trim());
                     if (start > end) {
                         throw new IOException("start must not be greater than end in " + file.getName());
                     }
-                    return new int[]{start, end};
+                    return new long[]{start, end};
                 } catch (NumberFormatException e) {
                     throw new IOException("invalid range '" + line + "' in " + file.getName(), e);
                 }

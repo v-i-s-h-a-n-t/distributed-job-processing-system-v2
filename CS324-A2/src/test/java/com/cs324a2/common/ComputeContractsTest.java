@@ -89,10 +89,10 @@ class ComputeContractsTest {
                 () -> JobRequest.primeSum("job", 10, 2));
         assertThrows(IllegalArgumentException.class,
                 () -> new JobRequest("job", ComputeOperation.PRIMESUM,
-                        List.of(2, 3), 2, 10));
+                        List.of(2, 3), 2L, 10L));
         assertThrows(IllegalArgumentException.class,
                 () -> new JobRequest("job", ComputeOperation.MAX,
-                        List.of(1), 1, 10));
+                        List.of(1), 1L, 10L));
     }
 
     @Test

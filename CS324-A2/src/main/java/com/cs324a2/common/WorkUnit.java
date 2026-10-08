@@ -12,8 +12,8 @@ public record WorkUnit(
         int partitionId,
         ComputeOperation operation,
         List<Integer> numbers,
-        Integer start,
-        Integer end) implements Serializable {
+        Long start,
+        Long end) implements Serializable {
 
     @Serial
     private static final long serialVersionUID = 1L;
@@ -39,7 +39,7 @@ public record WorkUnit(
         return new WorkUnit(jobId, partitionId, ComputeOperation.MAX, numbers, null, null);
     }
 
-    public static WorkUnit primeSum(String jobId, int partitionId, int start, int end) {
+    public static WorkUnit primeSum(String jobId, int partitionId, long start, long end) {
         return new WorkUnit(jobId, partitionId, ComputeOperation.PRIMESUM, null, start, end);
     }
 

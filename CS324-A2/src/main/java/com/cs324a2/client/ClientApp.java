@@ -86,8 +86,8 @@ public class ClientApp extends JFrame {
     private final JTextField clientIdField = new JTextField("client-" + UUID.randomUUID().toString().substring(0, 4));
     private final JComboBox<ComputeOperation> operationBox = new JComboBox<>(ComputeOperation.values());
     private final JTextArea numbersArea = new JTextArea();
-    private final JSpinner startField = new JSpinner(new SpinnerNumberModel(1, Integer.MIN_VALUE, Integer.MAX_VALUE, 1));
-    private final JSpinner endField = new JSpinner(new SpinnerNumberModel(1000, Integer.MIN_VALUE, Integer.MAX_VALUE, 1));
+    private final JSpinner startField = new JSpinner(new SpinnerNumberModel(1L, Long.MIN_VALUE, Long.MAX_VALUE, 1L));
+    private final JSpinner endField = new JSpinner(new SpinnerNumberModel(1000L, Long.MIN_VALUE, Long.MAX_VALUE, 1L));
 
     private final CardLayout inputLayout = new CardLayout();
     private final JPanel inputPanel = new JPanel(inputLayout);
@@ -478,7 +478,7 @@ public class ClientApp extends JFrame {
         File file = chooser.getSelectedFile();
         try {
             if (operationBox.getSelectedItem() == ComputeOperation.PRIMESUM) {
-                int[] range = JobParser.loadPrimeSumRange(file);
+                long[] range = JobParser.loadPrimeSumRange(file);
                 startField.setValue(range[0]);
                 endField.setValue(range[1]);
             } else {
@@ -498,8 +498,8 @@ public class ClientApp extends JFrame {
         String inputSummary;
         try {
             if (op == ComputeOperation.PRIMESUM) {
-                int start = (Integer) startField.getValue();
-                int end = (Integer) endField.getValue();
+                long start = ((Number) startField.getValue()).longValue();
+                long end = ((Number) endField.getValue()).longValue();
                 request = JobRequest.primeSum(jobId, start, end);
                 inputSummary = start + "," + end;
             } else if (op == ComputeOperation.MAX) {

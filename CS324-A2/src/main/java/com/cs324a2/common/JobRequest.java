@@ -11,8 +11,8 @@ public record JobRequest(
         String jobId,
         ComputeOperation operation,
         List<Integer> numbers,
-        Integer start,
-        Integer end) implements Serializable {
+        Long start,
+        Long end) implements Serializable {
 
     @Serial
     private static final long serialVersionUID = 1L;
@@ -45,7 +45,7 @@ public record JobRequest(
         return new JobRequest(jobId, ComputeOperation.MAX, numbers, null, null);
     }
 
-    public static JobRequest primeSum(String jobId, int start, int end) {
+    public static JobRequest primeSum(String jobId, long start, long end) {
         return new JobRequest(jobId, ComputeOperation.PRIMESUM, null, start, end);
     }
 
@@ -74,18 +74,23 @@ public record JobRequest(
         return List.copyOf(numbers);
     }
 
-    private static void requireNoRange(Integer start, Integer end) {
+    private static void requireNoRange(Long start, Long end) {
         if (start != null || end != null) {
             throw new IllegalArgumentException("list operations must not contain range bounds");
         }
     }
 
-    private static void validateRange(Integer start, Integer end) {
+    private static void validateRange(Long start, Long end) {
         if (start == null || end == null) {
             throw new IllegalArgumentException("PRIMESUM requires both range bounds");
         }
         if (start > end) {
             throw new IllegalArgumentException("start must not be greater than end");
+        }
+        try {
+            Math.addExact(Math.subtractExact(end, start), 1L);
+        } catch (ArithmeticException e) {
+            throw new IllegalArgumentException("PRIMESUM range is too wide", e);
         }
     }
 }

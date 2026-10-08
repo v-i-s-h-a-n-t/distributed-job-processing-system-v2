@@ -9,13 +9,15 @@ Java RMI cluster that runs distributed jobs across worker nodes under an elected
 
 ## Build
 
+Run these commands from the `CS324-A2` directory (the directory containing this `pom.xml`).
+
 ```bat
 mvn package -DskipTests
 ```
 
 ## Run
 
-Use a separate terminal for each process.
+Use a separate terminal for each process. Run each command from the `CS324-A2` directory. After rebuilding, restart the bootstrap, workers, and client so they all load the same classes.
 
 1. Bootstrap node (directory service, default port 1099):
 
@@ -60,7 +62,7 @@ value
 3279
 ```
 
-Range jobs (`PRIMESUM`): single row with optional header:
+Range jobs (`PRIMESUM`): single row with optional header. Endpoints accept 64-bit integers. The sieve supports endpoints up to 2,500,000,000,000,000; very wide ranges can still take a long time, and a sum too large for a 64-bit result fails with an overflow error. The calculation uses a segmented sieve:
 
 ```csv
 start,end

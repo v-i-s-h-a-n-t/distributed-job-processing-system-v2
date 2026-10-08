@@ -72,10 +72,12 @@ public final class WorkPartitioner {
         long nextStart = request.start();
         for (int partitionId = 0; partitionId < partitionCount; partitionId++) {
             long partitionSize = baseSize + (partitionId < remainder ? 1L : 0L);
-            long partitionEnd = nextStart + partitionSize - 1L;
+            long partitionEnd = nextStart + (partitionSize - 1L);
             partitions.add(WorkUnit.primeSum(
-                    request.jobId(), partitionId, (int) nextStart, (int) partitionEnd));
-            nextStart = partitionEnd + 1L;
+                    request.jobId(), partitionId, nextStart, partitionEnd));
+            if (partitionId + 1 < partitionCount) {
+                nextStart = partitionEnd + 1L;
+            }
         }
 
         return List.copyOf(partitions);

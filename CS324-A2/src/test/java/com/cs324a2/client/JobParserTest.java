@@ -76,25 +76,25 @@ class JobParserTest {
     @Test
     void loadPrimeSumRangeReadsRangeWithHeader() throws IOException {
         Path file = write("start,end\n1,1000\n");
-        assertArrayEquals(new int[]{1, 1000}, JobParser.loadPrimeSumRange(file.toFile()));
+        assertArrayEquals(new long[]{1, 1000}, JobParser.loadPrimeSumRange(file.toFile()));
     }
 
     @Test
     void loadPrimeSumRangeReadsRangeWithoutHeader() throws IOException {
         Path file = write("2, 10\n");
-        assertArrayEquals(new int[]{2, 10}, JobParser.loadPrimeSumRange(file.toFile()));
+        assertArrayEquals(new long[]{2, 10}, JobParser.loadPrimeSumRange(file.toFile()));
     }
 
     @Test
     void loadPrimeSumRangeSkipsCommentsAndBlankLines() throws IOException {
         Path file = write("# range file\nstart end\n\n1 1000\n");
-        assertArrayEquals(new int[]{1, 1000}, JobParser.loadPrimeSumRange(file.toFile()));
+        assertArrayEquals(new long[]{1, 1000}, JobParser.loadPrimeSumRange(file.toFile()));
     }
 
     @Test
     void loadPrimeSumRangeAcceptsEqualEndpoints() throws IOException {
         Path file = write("7,7\n");
-        assertArrayEquals(new int[]{7, 7}, JobParser.loadPrimeSumRange(file.toFile()));
+        assertArrayEquals(new long[]{7, 7}, JobParser.loadPrimeSumRange(file.toFile()));
     }
 
     @Test
