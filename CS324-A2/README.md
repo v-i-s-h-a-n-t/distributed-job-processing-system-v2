@@ -35,6 +35,8 @@ java -cp target/classes com.cs324a2.worker.WorkerNode 3 localhost 1099
 
 New workers register with the bootstrap and connect to one random active worker. Leave them running.
 
+Workers send a heartbeat to the bootstrap every 2 seconds. If a worker misses heartbeats for 8 seconds, the bootstrap removes it from the active-worker list, and the client's online-worker count updates on its next poll. A graceful worker shutdown deregisters immediately.
+
 3. Client GUI (run one or more instances):
 
 ```bat

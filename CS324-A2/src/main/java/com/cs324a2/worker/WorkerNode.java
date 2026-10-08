@@ -16,6 +16,7 @@ import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
 import java.util.concurrent.Future;
 import java.util.concurrent.RejectedExecutionException;
+import java.util.concurrent.ScheduledExecutorService;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicInteger;
 import java.util.concurrent.atomic.AtomicLong;
@@ -41,6 +42,7 @@ public class WorkerNode extends UnicastRemoteObject implements WorkerInterface {
     private final String rmiAddress;
     private final ExecutorService computeExecutor;
     private final ExecutorService dispatchExecutor;
+    private final ScheduledExecutorService heartbeatExecutor;
     private final CopyOnWriteArrayList<WorkerInterface> neighbors = new CopyOnWriteArrayList<>();
     private final AtomicInteger jac = new AtomicInteger(0);
     private final AtomicInteger jobsInCurrentTerm = new AtomicInteger(0);
@@ -73,6 +75,7 @@ public class WorkerNode extends UnicastRemoteObject implements WorkerInterface {
         this.rmiAddress = "//" + bootstrapHost + ":" + bootstrapPort + "/Worker-" + workerId;
         this.computeExecutor = createComputeExecutor();
         this.dispatchExecutor = createDispatchExecutor();
+        this.heartbeatExecutor = createHeartbeatExecutor();
         initRmiAndBootstrap(bootstrapHost, bootstrapPort);
         registerShutdownHook();
     }
@@ -94,6 +97,7 @@ public class WorkerNode extends UnicastRemoteObject implements WorkerInterface {
         this.rmiAddress = "test://Worker-" + workerId;
         this.computeExecutor = createComputeExecutor();
         this.dispatchExecutor = createDispatchExecutor();
+        this.heartbeatExecutor = createHeartbeatExecutor();
         this.bootstrap = null;
         System.out.println("[Worker " + workerId + "] test-mode node created");
     }
@@ -110,6 +114,14 @@ public class WorkerNode extends UnicastRemoteObject implements WorkerInterface {
         return Executors.newFixedThreadPool(DISPATCH_POOL_SIZE, task -> {
             Thread thread = new Thread(task, "worker-" + workerId + "-dispatch");
             thread.setDaemon(false);
+            return thread;
+        });
+    }
+
+    private ScheduledExecutorService createHeartbeatExecutor() {
+        return Executors.newSingleThreadScheduledExecutor(task -> {
+            Thread thread = new Thread(task, "worker-" + workerId + "-heartbeat");
+            thread.setDaemon(true);
             return thread;
         });
     }
@@ -132,6 +144,7 @@ public class WorkerNode extends UnicastRemoteObject implements WorkerInterface {
                 BootstrapInterface bs = (BootstrapInterface) registry.lookup("BootstrapNode");
                 this.bootstrap = bs;
                 String randomNeighbor = bs.registerWorker(workerId, rmiAddress);
+                startHeartbeats();
                 System.out.println("[Worker " + workerId + "] registered with bootstrap, random neighbor=" + randomNeighbor);
                 if (randomNeighbor != null && !randomNeighbor.equals(rmiAddress)) {
                     try {
@@ -160,6 +173,21 @@ public class WorkerNode extends UnicastRemoteObject implements WorkerInterface {
         }
     }
 
+    private void startHeartbeats() {
+        heartbeatExecutor.scheduleWithFixedDelay(() -> {
+            BootstrapInterface currentBootstrap = bootstrap;
+            if (currentBootstrap == null) return;
+            try {
+                if (!currentBootstrap.heartbeat(workerId)) {
+                    currentBootstrap.registerWorker(workerId, rmiAddress);
+                    System.out.println("[Worker " + workerId + "] restored bootstrap registration");
+                }
+            } catch (Exception e) {
+                // A missed heartbeat is retried on the next interval.
+            }
+        }, 2, 2, TimeUnit.SECONDS);
+    }
+
     private void registerShutdownHook() {
         Runtime.getRuntime().addShutdownHook(new Thread(() -> {
             try {
@@ -170,6 +198,7 @@ public class WorkerNode extends UnicastRemoteObject implements WorkerInterface {
             } catch (Exception ignored) {
                 // best-effort deregistration
             } finally {
+                heartbeatExecutor.shutdownNow();
                 shutdownWorkerExecutors();
             }
         }, "worker-" + workerId + "-shutdown"));

@@ -14,6 +14,7 @@ import java.util.List;
  */
 public interface BootstrapInterface extends Remote {
     String registerWorker(int workerId, String rmiAddress) throws RemoteException;
+    boolean heartbeat(int workerId) throws RemoteException;
     void deregisterWorker(int workerId) throws RemoteException;
     List<String> getActiveWorkers() throws RemoteException;
 }

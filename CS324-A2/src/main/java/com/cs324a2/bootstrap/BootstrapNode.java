@@ -12,6 +12,9 @@ import java.rmi.server.UnicastRemoteObject;
 import java.util.ArrayList;
 import java.util.List;
 import java.util.concurrent.ConcurrentHashMap;
+import java.util.concurrent.Executors;
+import java.util.concurrent.ScheduledExecutorService;
+import java.util.concurrent.TimeUnit;
 import java.util.concurrent.ThreadLocalRandom;
 
 import com.cs324a2.common.BootstrapInterface;
@@ -22,34 +25,57 @@ import com.cs324a2.common.BootstrapInterface;
  */
 public class BootstrapNode extends UnicastRemoteObject implements BootstrapInterface {
 
-    private final ConcurrentHashMap<Integer, String> activeWorkers;
+    static final long HEARTBEAT_TIMEOUT_MILLIS = 8_000L;
+    private static final long CLEANUP_INTERVAL_MILLIS = 2_000L;
+    private final ConcurrentHashMap<Integer, WorkerRegistration> activeWorkers;
+    private final ScheduledExecutorService heartbeatMonitor;
 
     public BootstrapNode() throws RemoteException {
         super();
         this.activeWorkers = new ConcurrentHashMap<>();
+        this.heartbeatMonitor = Executors.newSingleThreadScheduledExecutor(task -> {
+            Thread thread = new Thread(task, "bootstrap-heartbeat-monitor");
+            thread.setDaemon(true);
+            return thread;
+        });
+        heartbeatMonitor.scheduleAtFixedRate(
+                this::removeExpiredWorkers,
+                CLEANUP_INTERVAL_MILLIS,
+                CLEANUP_INTERVAL_MILLIS,
+                TimeUnit.MILLISECONDS);
     }
 
     @Override
     public synchronized String registerWorker(int workerId, String rmiAddress) throws RemoteException {
+        removeExpiredWorkers();
         if (activeWorkers.containsKey(workerId)) {
             throw new RemoteException("Worker ID " + workerId + " is already registered at "
-                    + activeWorkers.get(workerId) + ". Choose a different worker ID.");
+                    + activeWorkers.get(workerId).address() + ". Choose a different worker ID.");
         }
 
         String randomNeighborAddress = null;
 
         // If there are already workers in the network, pick a random one for the new node to connect to
         if (!activeWorkers.isEmpty()) {
-            List<String> currentNodes = new ArrayList<>(activeWorkers.values());
+            List<String> currentNodes = activeWorkers.values().stream()
+                    .map(WorkerRegistration::address)
+                    .toList();
             int randomIndex = ThreadLocalRandom.current().nextInt(currentNodes.size());
             randomNeighborAddress = currentNodes.get(randomIndex);
         }
 
         // Add the new worker to the directory
-        activeWorkers.put(workerId, rmiAddress);
+        activeWorkers.put(workerId, new WorkerRegistration(rmiAddress, System.nanoTime()));
         System.out.printf("Bootstrap Worker %d registered successfully at %s%n", workerId, rmiAddress);
 
         return randomNeighborAddress;
+    }
+
+    @Override
+    public boolean heartbeat(int workerId) throws RemoteException {
+        long now = System.nanoTime();
+        return activeWorkers.computeIfPresent(workerId,
+                (id, registration) -> registration.withHeartbeat(now)) != null;
     }
 
     @Override
@@ -59,12 +85,32 @@ public class BootstrapNode extends UnicastRemoteObject implements BootstrapInter
         }
     }
 
+    private void removeExpiredWorkers() {
+        long now = System.nanoTime();
+        long timeoutNanos = TimeUnit.MILLISECONDS.toNanos(HEARTBEAT_TIMEOUT_MILLIS);
+        activeWorkers.forEach((workerId, registration) -> {
+            if (now - registration.lastHeartbeatNanos() > timeoutNanos
+                    && activeWorkers.remove(workerId, registration)) {
+                System.out.printf("Bootstrap Worker %d at %s expired (missed heartbeats).%n",
+                        workerId, registration.address());
+            }
+        });
+    }
+
+    private record WorkerRegistration(String address, long lastHeartbeatNanos) {
+        private WorkerRegistration withHeartbeat(long timestamp) {
+            return new WorkerRegistration(address, timestamp);
+        }
+    }
+
     @Override
     public List<String> getActiveWorkers() throws RemoteException {
-        return new ArrayList<>(activeWorkers.values());
+        removeExpiredWorkers();
+        return activeWorkers.values().stream().map(WorkerRegistration::address).toList();
     }
 
     private void shutdown(Registry registry) {
+        heartbeatMonitor.shutdownNow();
         try {
             registry.unbind("BootstrapNode");
         } catch (RemoteException | NotBoundException e) {
