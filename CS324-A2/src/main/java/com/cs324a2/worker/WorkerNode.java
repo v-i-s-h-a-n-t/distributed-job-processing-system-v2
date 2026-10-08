@@ -30,24 +30,6 @@ import com.cs324a2.common.WorkerInterface;
 import com.cs324a2.compute.ComputeEngine;
 import com.cs324a2.compute.ResultAggregator;
 import com.cs324a2.compute.WorkPartitioner;
-
-/**
- * WorkerNode – Member 2 deliverable.
- * Implements leader election via flooding + convergecast (echo) over the
- * unstructured RMI neighbour graph.
- *
- * Requirements satisfied:
- *  - ELECTION message propagated through unstructured network
- *  - Duplicate suppression (seenElectionIds per messageId)
- *  - All reachable active workers considered (DFS convergecast)
- *  - Lowest JAC wins, tie -> highest ID
- *  - COORDINATOR flood after election
- *  - Single coordinator per term, term = 5 job assignments
- *  - JAC incremented each time coordinator assigns a job
- *  - Thread-safe for concurrent jobs (Member 3 will share thread pool)
- *
- * @author Member 2
- */
 public class WorkerNode extends UnicastRemoteObject implements WorkerInterface {
 
     private static final long serialVersionUID = 1L;
