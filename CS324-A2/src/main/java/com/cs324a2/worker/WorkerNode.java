@@ -28,7 +28,6 @@ import com.cs324a2.common.JobRequest;
 import com.cs324a2.common.WorkResult;
 import com.cs324a2.common.WorkUnit;
 import com.cs324a2.common.WorkerInterface;
-import com.cs324a2.compute.ComputeEngine;
 import com.cs324a2.compute.ResultAggregator;
 import com.cs324a2.compute.WorkPartitioner;
 public class WorkerNode extends UnicastRemoteObject implements WorkerInterface {
@@ -43,6 +42,7 @@ public class WorkerNode extends UnicastRemoteObject implements WorkerInterface {
     private final ExecutorService computeExecutor;
     private final ExecutorService dispatchExecutor;
     private final ScheduledExecutorService heartbeatExecutor;
+    private final WorkUnitProcessor workUnitProcessor = new WorkUnitProcessor();
     private final CopyOnWriteArrayList<WorkerInterface> neighbors = new CopyOnWriteArrayList<>();
     private final AtomicInteger jac = new AtomicInteger(0);
     private final AtomicInteger jobsInCurrentTerm = new AtomicInteger(0);
@@ -286,13 +286,7 @@ public class WorkerNode extends UnicastRemoteObject implements WorkerInterface {
      * seam without exposing computation details through the remote interface.
      */
     protected WorkResult computeWorkUnit(WorkUnit workUnit) {
-        long value = switch (workUnit.operation()) {
-            case MAX -> ComputeEngine.max(workUnit.numbers());
-            case PRIMESUM -> ComputeEngine.primeSum(workUnit.start(), workUnit.end());
-            case PRIMECOUNT -> ComputeEngine.primeCount(workUnit.numbers());
-        };
-        return new WorkResult(
-                workUnit.jobId(), workUnit.partitionId(), workUnit.operation(), value);
+        return workUnitProcessor.execute(workUnit);
     }
 
     // ---- WorkerInterface : coordinator-side job submission ----

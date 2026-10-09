@@ -1,0 +1,50 @@
+syntax = "proto3";
+
+package cs324a2.worker;
+
+option java_multiple_files = true;
+option java_package = "com.cs324a2.grpc.worker";
+option java_outer_classname = "WorkerProto";
+
+service WorkerService {
+  rpc ExecuteTask(ExecuteTaskRequest) returns (ExecuteTaskResponse);
+}
+
+enum Operation {
+  OPERATION_UNSPECIFIED = 0;
+  MAX = 1;
+  PRIMESUM = 2;
+  PRIMECOUNT = 3;
+}
+
+message NumberPayload {
+  repeated sint32 numbers = 1;
+}
+
+message RangePayload {
+  sint64 start = 1;
+  sint64 end = 2;
+}
+
+message ExecuteTaskRequest {
+  string task_id = 1;
+  string job_id = 2;
+  int32 partition_id = 3;
+  int32 attempt = 4;
+  Operation operation = 5;
+
+  oneof payload {
+    NumberPayload number_payload = 6;
+    RangePayload range_payload = 7;
+  }
+}
+
+message ExecuteTaskResponse {
+  string task_id = 1;
+  string job_id = 2;
+  int32 partition_id = 3;
+  int32 attempt = 4;
+  int32 worker_id = 5;
+  Operation operation = 6;
+  int64 value = 7;
+}
