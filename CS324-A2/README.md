@@ -35,6 +35,18 @@ Workers should heartbeat every 2 seconds. Bootstrap expires a worker after 8 sec
 
 The worker and client launch commands below still use the existing RMI implementation. Use a separate terminal for each process and run each command from the `CS324-A2` directory. These commands will be migrated as the other gRPC services are integrated.
 
+## Run a gRPC computation worker
+
+Start the Bootstrap gRPC server first, then start each worker with a unique ID,
+an address reachable by the other cluster machines, and a unique listening port:
+
+```bat
+mvn exec:java -Dexec.mainClass=com.cs324a2.worker.WorkerServer -Dexec.args="1 192.168.1.20 51001 localhost 50051"
+```
+
+The worker starts its task server before registering with Bootstrap and stops
+accepting tasks before deregistering during graceful shutdown.
+
 1. Bootstrap node (directory service, default port 1099):
 
 ```bat
