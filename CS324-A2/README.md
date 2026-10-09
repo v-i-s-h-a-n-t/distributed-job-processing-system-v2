@@ -1,6 +1,6 @@
 # CS324-A2
 
-Java RMI cluster that runs distributed jobs across worker nodes under an elected coordinator.
+This project contains the original Assignment 1 RMI cluster and the Assignment 2 gRPC Bootstrap and worker services. The gRPC worker path can register with Bootstrap, while the legacy client and coordinator flow still uses RMI.
 
 ## Prerequisites
 
@@ -29,23 +29,33 @@ Start the Bootstrap gRPC membership service on port `50051`:
 mvn exec:java -Dexec.mainClass=com.cs324a2.bootstrap.BootstrapServer -Dexec.args="50051"
 ```
 
-Workers should heartbeat every 2 seconds. Bootstrap expires a worker after 8 seconds without a heartbeat. `WatchMembership` sends a fresh snapshot when a client connects, followed by live join and leave events. Worker startup will be switched to this Bootstrap service as the worker gRPC service is integrated.
-
-## Run current Assignment 1 cluster
-
-The worker and client launch commands below still use the existing RMI implementation. Use a separate terminal for each process and run each command from the `CS324-A2` directory. These commands will be migrated as the other gRPC services are integrated.
+The gRPC worker sends a heartbeat every 2 seconds. Bootstrap expires a worker after 8 seconds without a heartbeat. `WatchMembership` sends a fresh snapshot when a client connects, followed by live join and leave events.
 
 ## Run a gRPC computation worker
 
-Start the Bootstrap gRPC server first, then start each worker with a unique ID,
-an address reachable by the other cluster machines, and a unique listening port:
+Start the Bootstrap gRPC server first. Then start each worker with a unique ID,
+a unique listening port, and an advertised host address reachable by the other
+cluster machines. When all processes run on one computer, use `localhost` as
+the advertised host:
 
 ```bat
-mvn exec:java -Dexec.mainClass=com.cs324a2.worker.WorkerServer -Dexec.args="1 192.168.1.20 51001 localhost 50051"
+mvn exec:java -Dexec.mainClass=com.cs324a2.worker.WorkerServer -Dexec.args="1 localhost 51001 localhost 50051"
+mvn exec:java -Dexec.mainClass=com.cs324a2.worker.WorkerServer -Dexec.args="2 localhost 51002 localhost 50051"
+mvn exec:java -Dexec.mainClass=com.cs324a2.worker.WorkerServer -Dexec.args="3 localhost 51003 localhost 50051"
 ```
 
-The worker starts its task server before registering with Bootstrap and stops
-accepting tasks before deregistering during graceful shutdown.
+Each worker starts its task server before registering with Bootstrap. On
+graceful shutdown, it stops accepting tasks and deregisters. For workers on
+different computers, replace `localhost` in the advertised-host argument with
+the worker computer's reachable IP address. The Bootstrap host argument must
+also be reachable from each worker.
+
+## Run the legacy Assignment 1 RMI cluster
+
+The commands in this section run the original RMI implementation. They use a
+separate RMI Bootstrap on port `1099`; they do not use the gRPC Bootstrap on
+port `50051`. Run each command from the `CS324-A2` directory, with a separate
+terminal for each process.
 
 1. Bootstrap node (directory service, default port 1099):
 
