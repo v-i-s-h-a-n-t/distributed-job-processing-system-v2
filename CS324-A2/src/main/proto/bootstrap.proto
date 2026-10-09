@@ -1,0 +1,133 @@
+syntax = "proto3";
+
+package cs324a2.bootstrap;
+
+//Generate one java class per message and service type.
+option java_multiple_files = true;
+option java_package = "com.cs324a2.grpc.bootstrap";
+option java_outer_classname = "BootstrapProto";
+
+//Track worker processes that are part of the cluster.
+service BootstrapService {
+  // Registers a worker and returns its unique registration ID plus a snapshot of the workers currently known to Bootstrap.
+  rpc RegisterWorker(RegisterWorkerRequest)
+      returns (RegisterWorkerResponse);
+
+  // Renews the worker's registration lease. The registration ID ensures that an old worker process cannot renew a replacement process's lease.
+  rpc Heartbeat(HeartbeatRequest)
+      returns (HeartbeatResponse);
+
+  // Removes a worker during graceful shutdown. A matching registration ID is required so an old process cannot remove a newer registration.
+  rpc DeregisterWorker(DeregisterWorkerRequest)
+      returns (DeregisterWorkerResponse);
+
+  // Returns the current active-worker snapshot and its membership version.
+  rpc ListWorkers(ListWorkersRequest)
+      returns (ListWorkersResponse);
+
+  // Sends the current membership snapshot, then streams worker join and leave events. If the stream disconnects, reconnect and request a fresh snapshot.
+  rpc WatchMembership(WatchMembershipRequest)
+      returns (stream MembershipEvent);
+}
+
+// Network address and registration identity for a worker process.
+message WorkerEndpoint {
+  // Unique worker number chosen when starting the worker.
+  int32 worker_id = 1;
+
+  // Hostname or IP address other cluster nodes can reach.
+  string host = 2;
+
+  // TCP port where this worker's gRPC server listens.
+  int32 port = 3;
+
+  // Random ID created for this registration. Changes when the process registers again, including after a Bootstrap restart.
+  string registration_id = 4;
+}
+
+// Data sent by the worker while joining the cluster.
+message RegisterWorkerRequest {
+  int32 worker_id = 1;
+  string host = 2;
+  int32 port = 3;
+}
+
+// Response from Bootstrap after accepting worker registration.
+message RegisterWorkerResponse {
+  // The worker must include this ID in heartbeats and deregistration calls.
+  string registration_id = 1;
+
+  // Workers active when this registration completed.
+  repeated WorkerEndpoint active_workers = 2;
+
+  // Version of membership represented by this response.
+  int64 membership_version = 3;
+}
+
+// Data sent periodically by a registered worker to renew its active term.
+message HeartbeatRequest {
+  int32 worker_id = 1;
+  string registration_id = 2;
+}
+
+// Check whether Bootstrap accepted the heartbeat and the lease time remaining.
+message HeartbeatResponse {
+  // False means the worker should register again.
+  bool accepted = 1;
+
+  // Lease duration in milliseconds. The worker should heartbeat before this duration expires.
+  int64 lease_remaining_millis = 2;
+}
+
+// Data sent when a worker shuts down.
+message DeregisterWorkerRequest {
+  int32 worker_id = 1;
+  string registration_id = 2;
+}
+
+// Check whether Bootstrap removed the matching worker registration.
+message DeregisterWorkerResponse {
+  bool removed = 1;
+}
+
+// Empty request to ask Bootstrap for the current membership snapshot.
+message ListWorkersRequest {}
+
+// Current active workers and the version of this membership snapshot.
+message ListWorkersResponse {
+  repeated WorkerEndpoint active_workers = 1;
+  int64 membership_version = 2;
+}
+
+// Starts a membership watch. The server sends a fresh snapshot on connection, clients use the returned version to track later changes.
+message WatchMembershipRequest {
+  // Last version the client applied. The server may use this for replay if event history is supported; otherwise it sends a fresh snapshot.
+  int64 after_version = 1;
+}
+
+// A snapshot or one change to the active-worker membership.
+message MembershipEvent {
+  enum Type {
+    TYPE_UNSPECIFIED = 0;
+
+    // Full current worker list. Sent first when a watch begins.
+    SNAPSHOT = 1;
+
+    // A worker registered successfully.
+    WORKER_JOINED = 2;
+
+    // A worker deregistered or expired after missed heartbeats.
+    WORKER_LEFT = 3;
+  }
+
+  Type type = 1;
+
+  // Worker associated with a join or leave event.
+  WorkerEndpoint worker = 2;
+
+  // Full worker list for SNAPSHOT events. Empty for join and leave events.
+  repeated WorkerEndpoint active_workers = 3;
+
+  // Increasing membership version. Clients can detect if they missed events.
+  int64 membership_version = 4;
+}
