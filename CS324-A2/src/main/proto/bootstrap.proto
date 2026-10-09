@@ -2,12 +2,12 @@ syntax = "proto3";
 
 package cs324a2.bootstrap;
 
-//Generate one java class per message and service type.
+// Generate one Java class per message and service type.
 option java_multiple_files = true;
 option java_package = "com.cs324a2.grpc.bootstrap";
 option java_outer_classname = "BootstrapProto";
 
-//Track worker processes that are part of the cluster.
+// Tracks worker processes that are part of the cluster.
 service BootstrapService {
   // Registers a worker and returns its unique registration ID plus a snapshot of the workers currently known to Bootstrap.
   rpc RegisterWorker(RegisterWorkerRequest)
@@ -64,7 +64,7 @@ message RegisterWorkerResponse {
   int64 membership_version = 3;
 }
 
-// Data sent periodically by a registered worker to renew its active term.
+  // Data sent periodically by a registered worker to renew its registration lease.
 message HeartbeatRequest {
   int32 worker_id = 1;
   string registration_id = 2;
@@ -99,9 +99,12 @@ message ListWorkersResponse {
   int64 membership_version = 2;
 }
 
-// Starts a membership watch. The server sends a fresh snapshot on connection, clients use the returned version to track later changes.
+// Starts a membership watch. The server always sends a fresh snapshot on
+// connection, followed by live events. Reconnecting clients replace their
+// membership view with the new snapshot; event history is not replayed.
 message WatchMembershipRequest {
-  // Last version the client applied. The server may use this for replay if event history is supported; otherwise it sends a fresh snapshot.
+  // Last version the client applied. Included for diagnostics and future
+  // replay support; the current server always responds with a fresh snapshot.
   int64 after_version = 1;
 }
 

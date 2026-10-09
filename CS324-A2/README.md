@@ -15,9 +15,25 @@ Run these commands from the `CS324-A2` directory (the directory containing this 
 mvn package -DskipTests
 ```
 
-## Run
+## Bootstrap gRPC service
 
-Use a separate terminal for each process. Run each command from the `CS324-A2` directory. After rebuilding, restart the bootstrap, workers, and client so they all load the same classes.
+Generate the Protocol Buffer and gRPC Java classes and compile the project from `CS324-A2`:
+
+```bat
+mvn package -DskipTests
+```
+
+Start the Bootstrap gRPC membership service on port `50051`:
+
+```bat
+mvn exec:java -Dexec.mainClass=com.cs324a2.bootstrap.BootstrapServer -Dexec.args="50051"
+```
+
+Workers should heartbeat every 2 seconds. Bootstrap expires a worker after 8 seconds without a heartbeat. `WatchMembership` sends a fresh snapshot when a client connects, followed by live join and leave events. Worker startup will be switched to this Bootstrap service as the worker gRPC service is integrated.
+
+## Run current Assignment 1 cluster
+
+The worker and client launch commands below still use the existing RMI implementation. Use a separate terminal for each process and run each command from the `CS324-A2` directory. These commands will be migrated as the other gRPC services are integrated.
 
 1. Bootstrap node (directory service, default port 1099):
 
@@ -34,8 +50,6 @@ java -cp target/classes com.cs324a2.worker.WorkerNode 3 localhost 1099
 ```
 
 New workers register with the bootstrap and connect to one random active worker. Leave them running.
-
-Workers send a heartbeat to the bootstrap every 2 seconds. If a worker misses heartbeats for 8 seconds, the bootstrap removes it from the active-worker list, and the client's online-worker count updates on its next poll. A graceful worker shutdown deregisters immediately.
 
 3. Client GUI (run one or more instances):
 
@@ -81,6 +95,12 @@ Sample files in `data/`:
 
 ```bat
 mvn test
+```
+
+Run only the Bootstrap membership tests:
+
+```bat
+mvn -Dtest=BootstrapGrpcServiceTest test
 ```
 
 ## Authors
