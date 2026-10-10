@@ -1,0 +1,165 @@
+syntax = "proto3";
+
+package cs324a2.coordinator;
+
+option java_multiple_files = true;
+option java_package = "com.cs324a2.grpc.coordinator";
+option java_outer_classname = "CoordinatorProto";
+
+// Replaces the legacy RMI election RPCs (propagateElection / propagateCoordinator
+// / initiateElection) with a Raft-style gRPC term, voting, heartbeat, and
+// replicated job-state contract.
+service CoordinatorService {
+  // One vote per term. Candidate wins only with a majority of known members.
+  rpc RequestVote(RequestVoteRequest) returns (RequestVoteResponse);
+
+  // Leader liveness. Also carries the leader identity so followers can detect
+  // a second claimant in the same term (split-brain protection).
+  rpc LeaderHeartbeat(LeaderHeartbeatRequest) returns (LeaderHeartbeatResponse);
+
+  // Push replication / checkpointing of one job snapshot. Each mutation carries
+  // a monotonic progress event number for ordering and recovery.
+  rpc ReplicateJobState(ReplicateJobStateRequest) returns (ReplicateJobStateResponse);
+
+  // Client entry point. Followers reject with the current leader hint;
+  // only the legitimate leader executes.
+  rpc SubmitJob(CoordinatorJobRequest) returns (CoordinatorJobResponse);
+
+  // Observability for tests and operators: term, leader, progress watermark,
+  // jobs, task states, results, and progress event numbers.
+  rpc GetCoordinatorState(GetCoordinatorStateRequest) returns (GetCoordinatorStateResponse);
+}
+
+enum Operation {
+  OPERATION_UNSPECIFIED = 0;
+  MAX = 1;
+  PRIMESUM = 2;
+  PRIMECOUNT = 3;
+}
+
+enum TaskStatus {
+  TASK_STATUS_UNSPECIFIED = 0;
+  TASK_PENDING = 1;
+  TASK_RUNNING = 2;
+  TASK_COMPLETED = 3;
+  TASK_FAILED = 4;
+}
+
+enum JobStatus {
+  JOB_STATUS_UNSPECIFIED = 0;
+  JOB_ACTIVE = 1;
+  JOB_COMPLETED = 2;
+  JOB_FAILED = 3;
+}
+
+// Wire form of a JobRequest. Numbers use sint32 to match worker.proto.
+message JobSpec {
+  string job_id = 1;
+  Operation operation = 2;
+  repeated sint32 numbers = 3;
+  sint64 start = 4;
+  sint64 end = 5;
+  bool has_range = 6;
+}
+
+message TaskStateProto {
+  string task_id = 1;
+  int32 partition_id = 2;
+  TaskStatus status = 3;
+  int32 attempt = 4;
+  int32 assigned_worker_id = 5;
+  int64 result_value = 6;
+  bool has_result = 7;
+  string last_failure = 8;
+  // Progress event number of the last mutation of this task.
+  int64 progress_index = 9;
+  // Partition payload (checkpointed so a successor can resume without the client).
+  repeated sint32 numbers = 10;
+  sint64 start = 11;
+  sint64 end = 12;
+  bool has_range = 13;
+}
+
+message JobStateProto {
+  JobSpec job = 1;
+  repeated TaskStateProto tasks = 2;
+  JobStatus status = 3;
+  int64 result_value = 4;
+  bool has_result = 5;
+  string error = 6;
+  // Highest progress event number touching this job.
+  int64 progress_index = 7;
+  // Leader term that admitted the job.
+  int64 term = 8;
+}
+
+message RequestVoteRequest {
+  int64 term = 1;
+  int32 candidate_id = 2;
+  // Candidate's replicated progress watermark; voters prefer up-to-date logs.
+  int64 last_progress_index = 3;
+}
+
+message RequestVoteResponse {
+  int64 term = 1;
+  bool vote_granted = 2;
+  int32 voter_id = 3;
+}
+
+message LeaderHeartbeatRequest {
+  int64 term = 1;
+  int32 leader_id = 2;
+  string leader_host = 3;
+  int32 leader_port = 4;
+  int64 commit_progress_index = 5;
+}
+
+message LeaderHeartbeatResponse {
+  int64 term = 1;
+  bool success = 2;
+  int32 follower_id = 3;
+}
+
+message ReplicateJobStateRequest {
+  int64 term = 1;
+  int32 leader_id = 2;
+  // Global progress event number for this mutation.
+  int64 progress_index = 3;
+  JobStateProto job_state = 4;
+}
+
+message ReplicateJobStateResponse {
+  int64 term = 1;
+  bool success = 2;
+  int32 follower_id = 3;
+}
+
+message CoordinatorJobRequest {
+  JobSpec job = 1;
+}
+
+message CoordinatorJobResponse {
+  // True when this node executed the job as leader.
+  bool executed = 1;
+  int64 term = 2;
+  int64 result_value = 3;
+  bool has_result = 4;
+  string error = 5;
+  // Leader hint for NOT_LEADER retries.
+  int32 leader_id = 6;
+  string leader_host = 7;
+  int32 leader_port = 8;
+  // Progress event number of the terminal job mutation.
+  int64 progress_index = 9;
+}
+
+message GetCoordinatorStateRequest {}
+
+message GetCoordinatorStateResponse {
+  int64 current_term = 1;
+  int32 leader_id = 2;
+  bool is_leader = 3;
+  int64 commit_progress_index = 4;
+  repeated JobStateProto jobs = 5;
+  int32 worker_id = 6;
+}

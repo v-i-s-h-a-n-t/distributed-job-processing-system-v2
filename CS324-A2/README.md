@@ -31,6 +31,56 @@ mvn exec:java -Dexec.mainClass=com.cs324a2.bootstrap.BootstrapServer -Dexec.args
 
 The gRPC worker sends a heartbeat every 2 seconds. Bootstrap expires a worker after 8 seconds without a heartbeat. `WatchMembership` sends a fresh snapshot when a client connects, followed by live join and leave events.
 
+## Coordinator election and job-state recovery (gRPC)
+
+All election RPCs travel over gRPC (`CoordinatorService` in
+`src/main/proto/coordinator.proto`), replacing the legacy RMI
+`propagateElection / propagateCoordinator` path for the gRPC cluster:
+
+- **Leader terms** — every vote, heartbeat, replicate, and submit carries a
+  monotonic term; stale terms are rejected and higher terms force step-down.
+- **Voting** — one vote per term; a candidate needs a majority of the
+  Bootstrap membership and must be at least as up-to-date (replicated progress
+  watermark) as the voter, so the winner can restore state.
+- **Leader heartbeats** — every 150 ms; followers start an election after a
+  randomized 500–1000 ms timeout without a valid heartbeat.
+- **Two-coordinator protection** — single vote per term, only the first leader
+  per term is recognised (a second claimant in the same term is rejected),
+  votes are denied while a live leader holds the term, and job admission
+  requires a majority heartbeat lease; leaders re-check leadership while a job
+  runs and abort on loss.
+- **Replication / checkpointing** — every mutation (admit, assign, complete,
+  retry, job done) takes the next global progress event number and is pushed
+  to followers via `ReplicateJobState` (job spec, per-task states, results,
+  progress numbers). Followers keep the newest snapshot per job.
+- **Recovery** — a newly elected leader reclaims in-flight (`RUNNING`) tasks
+  to `PENDING`, keeps `COMPLETED` results, and resumes unfinished jobs in the
+  background without client help.
+
+Run three combined worker+coordinator nodes (after starting Bootstrap on
+`50051`):
+
+```bat
+mvn exec:java -Dexec.mainClass=com.cs324a2.coordinator.CoordinatorServer -Dexec.args="1 localhost 51001 localhost 50051"
+mvn exec:java -Dexec.mainClass=com.cs324a2.coordinator.CoordinatorServer -Dexec.args="2 localhost 51002 localhost 50051"
+mvn exec:java -Dexec.mainClass=com.cs324a2.coordinator.CoordinatorServer -Dexec.args="3 localhost 51003 localhost 50051"
+```
+
+One node logs `*** ELECTED LEADER term=N ***` and followers accept its
+heartbeats. Submit a job to any node (followers forward over gRPC); watch
+`event=ADMIT/ASSIGN/COMPLETE ... progress=N` lines replicate.
+
+Kill-the-coordinator demo: submit a job, then kill the leader process
+mid-job. The survivors log a new `*** ELECTED LEADER term=N+1 ***`,
+`event=RECOVER` with the restored completed-task count, `event=RESUME`
+reclaiming in-flight tasks, then `event=COMPLETE`/`JOB_DONE` for the resumed
+work. Later jobs submitted to any survivor are accepted. The automated
+version of this demo is `CoordinatorFailoverTest`:
+
+```bat
+mvn -Dtest=CoordinatorFailoverTest test
+```
+
 ## Run a gRPC computation worker
 
 Start the Bootstrap gRPC server first. Then start each worker with a unique ID,
@@ -123,6 +173,12 @@ Run only the Bootstrap membership tests:
 
 ```bat
 mvn -Dtest=BootstrapGrpcServiceTest test
+```
+
+Run only the coordinator election and failover tests:
+
+```bat
+mvn -Dtest='CoordinatorElectionTest,CoordinatorFailoverTest' test
 ```
 
 ## Authors
