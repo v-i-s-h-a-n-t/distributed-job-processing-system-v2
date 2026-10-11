@@ -28,6 +28,13 @@ service CoordinatorService {
   // Observability for tests and operators: term, leader, progress watermark,
   // jobs, task states, results, and progress event numbers.
   rpc GetCoordinatorState(GetCoordinatorStateRequest) returns (GetCoordinatorStateResponse);
+
+  // Real-time job progress for the client GUI. Streams one update per
+  // distributed-work mutation (assign/complete/retry/job-done) based on actual
+  // completed tasks, not a timer. Works on leaders and followers: followers
+  // serve their replicated snapshot so progress survives coordinator failover.
+  // The stream completes when the job reaches a terminal state.
+  rpc SubscribeJobProgress(JobProgressRequest) returns (stream JobProgressUpdate);
 }
 
 enum Operation {
@@ -162,4 +169,40 @@ message GetCoordinatorStateResponse {
   int64 commit_progress_index = 4;
   repeated JobStateProto jobs = 5;
   int32 worker_id = 6;
+}
+
+// Subscribes to real-time progress for one job. Empty job_id is rejected.
+message JobProgressRequest {
+  string job_id = 1;
+}
+
+// Per-worker rollup of the tasks currently assigned to that worker.
+// worker_id is -1 for tasks not yet assigned to any worker.
+message WorkerProgress {
+  int32 worker_id = 1;
+  int32 total_tasks = 2;
+  int32 completed_tasks = 3;
+  int32 running_tasks = 4;
+  int32 pending_tasks = 5;
+  int32 failed_tasks = 6;
+}
+
+// One progress event for a job, derived from actual task checkpoints.
+message JobProgressUpdate {
+  string job_id = 1;
+  int32 total_tasks = 2;
+  int32 completed_tasks = 3;
+  int32 running_tasks = 4;
+  int32 pending_tasks = 5;
+  int32 failed_tasks = 6;
+  // completed_tasks / total_tasks (1.0 when total_tasks == 0).
+  double completion_fraction = 7;
+  int64 progress_index = 8;
+  JobStatus status = 9;
+  int64 result_value = 10;
+  bool has_result = 11;
+  string error = 12;
+  // Full checkpoint snapshot so clients can render per-task detail.
+  JobStateProto job_state = 13;
+  repeated WorkerProgress worker_breakdown = 14;
 }
