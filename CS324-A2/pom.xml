@@ -8,7 +8,6 @@
     <properties>
         <project.build.sourceEncoding>UTF-8</project.build.sourceEncoding>
         <maven.compiler.release>17</maven.compiler.release>
-        <exec.mainClass>com.cs324a2.CS324A2</exec.mainClass>
         <junit.version>5.10.2</junit.version>
         <grpc.version>1.84.1</grpc.version>
         <protobuf.version>3.25.9</protobuf.version>
