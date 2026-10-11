@@ -1,184 +1,163 @@
-# CS324-A2
+# CS324-A2 DistriLab
 
-This project contains the original Assignment 1 RMI cluster and the Assignment 2 gRPC Bootstrap and worker services. The gRPC worker path can register with Bootstrap, while the legacy client and coordinator flow still uses RMI.
+Distributed computing cluster using gRPC and Protocol Buffers for all
+inter-process communication. Worker processes form an unstructured network,
+elect a coordinator, accept jobs from multiple clients, and split work across
+available workers using Java threads.
 
-## Prerequisites
+The original Java RMI implementation is still in the repository for reference
+but is not used by the system below.
 
-- Java 17
-- Maven 3.9+
+## Requirements
+
+Java 17, Maven 3.9+
 
 ## Build
 
-Run these commands from the `CS324-A2` directory (the directory containing this `pom.xml`).
-
-```bat
+```bash
+cd CS324-A2
 mvn package -DskipTests
 ```
 
-## Bootstrap gRPC service
+Run processes with `mvn exec:java`. A bare `java -cp target/classes` fails with
+`NoClassDefFoundError` because the gRPC and protobuf jars are not on that
+classpath.
 
-Generate the Protocol Buffer and gRPC Java classes and compile the project from `CS324-A2`:
+## Running the cluster
 
-```bat
-mvn package -DskipTests
-```
+Each command runs in its own terminal, from `CS324-A2`.
 
-Start the Bootstrap gRPC membership service on port `50051`:
+Bootstrap, the membership directory:
 
-```bat
+```bash
 mvn exec:java -Dexec.mainClass=com.cs324a2.bootstrap.BootstrapServer -Dexec.args="50051"
 ```
 
-The gRPC worker sends a heartbeat every 2 seconds. Bootstrap expires a worker after 8 seconds without a heartbeat. `WatchMembership` sends a fresh snapshot when a client connects, followed by live join and leave events.
+Worker and coordinator nodes. Arguments are
+`<workerId> <advertisedHost> <workerPort> <bootstrapHost> <bootstrapPort>`.
 
-## Coordinator election and job-state recovery (gRPC)
-
-All election RPCs travel over gRPC (`CoordinatorService` in
-`src/main/proto/coordinator.proto`), replacing the legacy RMI
-`propagateElection / propagateCoordinator` path for the gRPC cluster:
-
-- **Leader terms** — every vote, heartbeat, replicate, and submit carries a
-  monotonic term; stale terms are rejected and higher terms force step-down.
-- **Voting** — one vote per term; a candidate needs a majority of the
-  Bootstrap membership and must be at least as up-to-date (replicated progress
-  watermark) as the voter, so the winner can restore state.
-- **Leader heartbeats** — every 150 ms; followers start an election after a
-  randomized 500–1000 ms timeout without a valid heartbeat.
-- **Two-coordinator protection** — single vote per term, only the first leader
-  per term is recognised (a second claimant in the same term is rejected),
-  votes are denied while a live leader holds the term, and job admission
-  requires a majority heartbeat lease; leaders re-check leadership while a job
-  runs and abort on loss.
-- **Replication / checkpointing** — every mutation (admit, assign, complete,
-  retry, job done) takes the next global progress event number and is pushed
-  to followers via `ReplicateJobState` (job spec, per-task states, results,
-  progress numbers). Followers keep the newest snapshot per job.
-- **Recovery** — a newly elected leader reclaims in-flight (`RUNNING`) tasks
-  to `PENDING`, keeps `COMPLETED` results, and resumes unfinished jobs in the
-  background without client help.
-
-Run three combined worker+coordinator nodes (after starting Bootstrap on
-`50051`):
-
-```bat
+```bash
 mvn exec:java -Dexec.mainClass=com.cs324a2.coordinator.CoordinatorServer -Dexec.args="1 localhost 51001 localhost 50051"
 mvn exec:java -Dexec.mainClass=com.cs324a2.coordinator.CoordinatorServer -Dexec.args="2 localhost 51002 localhost 50051"
 mvn exec:java -Dexec.mainClass=com.cs324a2.coordinator.CoordinatorServer -Dexec.args="3 localhost 51003 localhost 50051"
 ```
 
-One node logs `*** ELECTED LEADER term=N ***` and followers accept its
-heartbeats. Submit a job to any node (followers forward over gRPC); watch
-`event=ADMIT/ASSIGN/COMPLETE ... progress=N` lines replicate.
+Client GUI:
 
-Kill-the-coordinator demo: submit a job, then kill the leader process
-mid-job. The survivors log a new `*** ELECTED LEADER term=N+1 ***`,
-`event=RECOVER` with the restored completed-task count, `event=RESUME`
-reclaiming in-flight tasks, then `event=COMPLETE`/`JOB_DONE` for the resumed
-work. Later jobs submitted to any survivor are accepted. The automated
-version of this demo is `CoordinatorFailoverTest`:
-
-```bat
-mvn -Dtest=CoordinatorFailoverTest test
+```bash
+mvn exec:java -Dexec.mainClass=com.cs324a2.client.ClientApp
 ```
 
-## Run a gRPC computation worker
+One node logs `*** ELECTED LEADER term=N ***`.
 
-Start the Bootstrap gRPC server first. Then start each worker with a unique ID,
-a unique listening port, and an advertised host address reachable by the other
-cluster machines. When all processes run on one computer, use `localhost` as
-the advertised host:
+On multiple machines, replace `localhost` in each worker's advertised host with
+its reachable IP address. A worker can also run task execution only, with no
+election duties:
 
-```bat
-mvn exec:java -Dexec.mainClass=com.cs324a2.worker.WorkerServer -Dexec.args="1 localhost 51001 localhost 50051"
-mvn exec:java -Dexec.mainClass=com.cs324a2.worker.WorkerServer -Dexec.args="2 localhost 51002 localhost 50051"
-mvn exec:java -Dexec.mainClass=com.cs324a2.worker.WorkerServer -Dexec.args="3 localhost 51003 localhost 50051"
+```bash
+mvn exec:java -Dexec.mainClass=com.cs324a2.worker.WorkerServer -Dexec.args="4 localhost 51004 localhost 50051"
 ```
 
-Each worker starts its task server before registering with Bootstrap. On
-graceful shutdown, it stops accepting tasks and deregisters. For workers on
-different computers, replace `localhost` in the advertised-host argument with
-the worker computer's reachable IP address. The Bootstrap host argument must
-also be reachable from each worker.
+## Services
 
-## Run the legacy Assignment 1 RMI cluster
+`bootstrap.proto` tracks live workers with `RegisterWorker`, `Heartbeat`,
+`DeregisterWorker`, `ListWorkers`, and the `WatchMembership` stream. Workers
+heartbeat every 2 seconds and are dropped after 8 seconds of silence.
 
-The commands in this section run the original RMI implementation. They use a
-separate RMI Bootstrap on port `1099`; they do not use the gRPC Bootstrap on
-port `50051`. Run each command from the `CS324-A2` directory, with a separate
-terminal for each process.
+`worker.proto` exposes `ExecuteTask`, which runs one partition.
 
-1. Bootstrap node (directory service, default port 1099):
+`coordinator.proto` covers election and dispatch: `RequestVote`,
+`LeaderHeartbeat`, `ReplicateJobState`, `SubmitJob`, `GetCoordinatorState`, and
+`SubscribeJobProgress`.
 
-```bat
-java -cp target/classes com.cs324a2.bootstrap.BootstrapNode 1099
-```
+## Client GUI
 
-2. Workers (each needs a unique integer ID):
+Set Host and Port in the CONNECTION section. Defaults are `localhost` and
+`50051`, the gRPC Bootstrap. The header shows the live worker count.
 
-```bat
-java -cp target/classes com.cs324a2.worker.WorkerNode 1 localhost 1099
-java -cp target/classes com.cs324a2.worker.WorkerNode 2 localhost 1099
-java -cp target/classes com.cs324a2.worker.WorkerNode 3 localhost 1099
-```
+Operations are `MAX`, `PRIMECOUNT`, and `PRIMESUM`. Enter values directly or use
+Load CSV. Multiple jobs run at once.
 
-New workers register with the bootstrap and connect to one random active worker. Leave them running.
+### Progress
 
-3. Client GUI (run one or more instances):
+The bar shows `completedTasks / totalTasks` taken from real task checkpoints,
+streamed over gRPC with `SubscribeJobProgress`. It does not advance on a timer.
+Range jobs are split into 4 sub-ranges per worker, capped at 32 tasks per job, so
+long sieves report progress steadily.
 
-```bat
-java -cp target/classes com.cs324a2.client.ClientApp
-```
+Click a bar for the worker breakdown: per-worker counts plus per-task detail
+(partition, status, worker, attempt, result). It refreshes while the job runs
+and keeps working across a coordinator failover.
 
-## Using the client
+Clear finished removes DONE and FAILED rows. Running jobs keep their streams.
 
-- Set Host, Port, and Client ID in the CONNECTION section. The header shows live worker count.
-- In NEW JOB, pick an operation:
-  - `MAX` — largest value in a list
-  - `PRIMECOUNT` — count of primes in a list
-  - `PRIMESUM` — sum of primes in a range
-- Enter data manually (`2, 4, 5, 11` or `start` / `end`) or use Load CSV.
-- Submit Job. Multiple jobs can run concurrently.
+### Input limits
 
-## CSV format
+`MAX` and `PRIMECOUNT` take 32-bit integers. `PRIMECOUNT` may be empty and
+returns 0. `PRIMESUM` takes an inclusive 64-bit range, read and validated in
+64-bit space with no silent rounding or clamping.
 
-List jobs (`MAX`, `PRIMECOUNT`): single column with optional header, one integer per line:
+The span `end - start + 1` is capped at 100,000,000 values
+(`JobRequest.MAX_RANGE_SPAN`), checked on typed, CSV, and submitted input alike.
+The sieve handles endpoints up to 2,500,000,000,000,000. Sums that overflow a
+64-bit result fail with an error.
 
-```csv
-value
-83811
-14593
-3279
-```
+## Failure handling
 
-Range jobs (`PRIMESUM`): single row with optional header. Endpoints accept 64-bit integers. The sieve supports endpoints up to 2,500,000,000,000,000; very wide ranges can still take a long time, and a sum too large for a 64-bit result fails with an overflow error. The calculation uses a segmented sieve:
+### Workers
 
-```csv
-start,end
-1,1000
-```
+Bootstrap drops a worker after 8 seconds without a heartbeat and broadcasts the
+removal. Failed tasks are retried elsewhere up to
+`SchedulerConfig.maximumAttempts`. Work left RUNNING by a dead worker returns to
+PENDING and is reassigned. New workers can join mid-job.
 
-Sample files in `data/`:
+### Coordinator
 
-- `numbers-sm.csv` with 100 entries
-- `numbers-md.csv` with 500 entries
-- `numbers-lg.csv` with 1000 entries
+Election is Raft-style over gRPC:
+
+- Monotonic terms. Stale terms are rejected, higher terms force a step down.
+- One vote per term. A candidate needs a majority of the membership and must be
+  at least as up to date as the voter, judged by the replicated progress
+  watermark.
+- Leader heartbeats every 150 ms. Followers start an election after 500 to
+  1000 ms without one.
+- Split-brain protection: only the first leader per term is recognised, votes
+  are denied while a live leader holds the term, and job admission needs a
+  majority lease. Leaders recheck leadership mid-job and abort on loss.
+- Every mutation (admit, assign, complete, retry, done) takes the next global
+  progress number and is replicated to followers with `ReplicateJobState`.
+- A new leader restores those snapshots, reclaims RUNNING tasks, keeps COMPLETED
+  results, and resumes unfinished jobs without client help.
+
+Demo: submit a wide PRIMESUM and kill the leader mid-job. The survivors elect a
+new leader and log `event=RECOVER`, `event=RESUME`, then `event=JOB_DONE`. The
+GUI bar keeps advancing because it follows replicated state.
 
 ## Tests
 
-```bat
+```bash
 mvn test
 ```
 
-Run only the Bootstrap membership tests:
+129 tests across 18 classes. Targeted runs:
 
-```bat
-mvn -Dtest=BootstrapGrpcServiceTest test
+```bash
+mvn -Dtest=BootstrapGrpcServiceTest test    # membership, leases, watch stream
+mvn -Dtest=CoordinatorElectionTest test     # terms, votes, split-brain
+mvn -Dtest=CoordinatorFailoverTest test     # kill the leader mid-job
+mvn -Dtest=CoordinatorProgressTest test     # progress streaming
+mvn -Dtest=GrpcClientServiceTest test       # discovery, submit, progress
 ```
 
-Run only the coordinator election and failover tests:
+## Legacy RMI cluster
 
-```bat
-mvn -Dtest='CoordinatorElectionTest,CoordinatorFailoverTest' test
+Assignment 1 code, kept for reference. It uses its own Bootstrap on port 1099
+and is not part of the gRPC system. Pointing the GUI at port 1099 runs jobs over
+RMI with indeterminate progress bars.
+
+```bash
+mvn exec:java -Dexec.mainClass=com.cs324a2.bootstrap.BootstrapNode -Dexec.args="1099"
+mvn exec:java -Dexec.mainClass=com.cs324a2.worker.WorkerNode -Dexec.args="1 localhost 1099"
 ```
 
 ## Authors
