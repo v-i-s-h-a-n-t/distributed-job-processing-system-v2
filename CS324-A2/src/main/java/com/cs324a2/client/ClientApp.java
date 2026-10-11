@@ -2,6 +2,8 @@ package com.cs324a2.client;
 
 import com.cs324a2.common.ComputeOperation;
 import com.cs324a2.common.JobRequest;
+import com.cs324a2.grpc.coordinator.JobProgressUpdate;
+import com.cs324a2.grpc.coordinator.JobStatus;
 import java.awt.BasicStroke;
 import java.awt.BorderLayout;
 import java.awt.CardLayout;
@@ -17,11 +19,17 @@ import java.awt.GridBagConstraints;
 import java.awt.GridBagLayout;
 import java.awt.Insets;
 import java.awt.RenderingHints;
+import java.awt.event.MouseAdapter;
+import java.awt.event.MouseEvent;
 import java.awt.geom.RoundRectangle2D;
 import java.io.File;
 import java.text.NumberFormat;
+import java.text.ParseException;
+import java.util.ArrayList;
 import java.util.List;
+import java.util.Map;
 import java.util.UUID;
+import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
 import java.util.concurrent.atomic.AtomicBoolean;
@@ -33,12 +41,14 @@ import javax.swing.DefaultListCellRenderer;
 import javax.swing.JButton;
 import javax.swing.JComboBox;
 import javax.swing.JComponent;
+import javax.swing.JDialog;
 import javax.swing.JFileChooser;
 import javax.swing.JFrame;
 import javax.swing.JLabel;
 import javax.swing.JList;
 import javax.swing.JOptionPane;
 import javax.swing.JPanel;
+import javax.swing.JProgressBar;
 import javax.swing.JScrollPane;
 import javax.swing.JSpinner;
 import javax.swing.JTable;
@@ -83,12 +93,14 @@ public class ClientApp extends JFrame {
     private Font headerFont;
 
     private final JTextField hostField = new JTextField("localhost");
-    private final JSpinner portField = new JSpinner(new SpinnerNumberModel(1099, 1, 65535, 1));
+    private final JSpinner portField = new JSpinner(new SpinnerNumberModel(50051, 1, 65535, 1));
     private final JTextField clientIdField = new JTextField("client-" + UUID.randomUUID().toString().substring(0, 4));
     private final JComboBox<ComputeOperation> operationBox = new JComboBox<>(ComputeOperation.values());
     private final JTextArea numbersArea = new JTextArea();
-    private final JSpinner startField = new JSpinner(new SpinnerNumberModel(1L, Long.MIN_VALUE, Long.MAX_VALUE, 1L));
-    private final JSpinner endField = new JSpinner(new SpinnerNumberModel(1000L, Long.MIN_VALUE, Long.MAX_VALUE, 1L));
+    private final JSpinner startField =
+            new JSpinner(new LongSpinnerModel(1L, Long.MIN_VALUE, Long.MAX_VALUE, 1L));
+    private final JSpinner endField =
+            new JSpinner(new LongSpinnerModel(1000L, Long.MIN_VALUE, Long.MAX_VALUE, 1L));
 
     private final CardLayout inputLayout = new CardLayout();
     private final JPanel inputPanel = new JPanel(inputLayout);
@@ -97,14 +109,34 @@ public class ClientApp extends JFrame {
     private final JLabel inputLabel = new JLabel();
     private final JLabel jobDescriptionLabel = new JLabel();
 
+    /** Column indices in the job history table. */
+    static final int COL_STATUS = 3;
+    static final int COL_PROGRESS = 4;
+    static final int COL_RESULT = 5;
+
     private final DefaultTableModel tableModel = new DefaultTableModel(
-            new Object[]{"Job", "Operation", "Input", "Status", "Result"}, 0) {
+            new Object[]{"Job", "Operation", "Input", "Status", "Progress", "Result"}, 0) {
         @Override
         public boolean isCellEditable(int row, int column) {
             return false;
         }
+
+        @Override
+        public Class<?> getColumnClass(int column) {
+            return column == COL_PROGRESS ? Integer.class : Object.class;
+        }
     };
     private final JTable table = new JTable(tableModel);
+    /**
+     * Latest streamed progress per job, keyed by job ID (not row index) so
+     * history rows can be cleared while other jobs are still running.
+     */
+    private final Map<String, JobProgressUpdate> progressByJob = new ConcurrentHashMap<>();
+    /** Jobs submitted via the legacy RMI path (absent means gRPC streaming). */
+    private final Map<String, Boolean> rmiByJob = new ConcurrentHashMap<>();
+    /** Active progress-stream handles per job, cancelled on completion/dispose. */
+    private final Map<String, GrpcClientService.ProgressHandle> progressHandles =
+            new ConcurrentHashMap<>();
 
     private final JLabel statusLabel = new JLabel("0 workers online");
     private final JLabel runningLabel = new JLabel("0 running");
@@ -217,11 +249,10 @@ public class ClientApp extends JFrame {
     }
 
     private void styleSpinner(JSpinner spinner) {
-        JSpinner.NumberEditor editor = new JSpinner.NumberEditor(spinner, "#");
-        NumberFormat format = editor.getFormat();
-        if (format != null) {
-            format.setGroupingUsed(false);
-        }
+        // Pattern "0" (no grouping element) renders the typed digits verbatim:
+        // large bounds must never appear as "1,000,000,000,000" or, worse, be
+        // rounded through a double.
+        JSpinner.NumberEditor editor = new JSpinner.NumberEditor(spinner, "0");
         spinner.setEditor(editor);
         spinner.setBackground(SURFACE);
         spinner.setFont(bodyFont);
@@ -259,10 +290,24 @@ public class ClientApp extends JFrame {
         header.setDefaultRenderer(new HeaderRenderer());
 
         table.getColumnModel().getColumn(0).setPreferredWidth(130);
-        table.getColumnModel().getColumn(1).setPreferredWidth(120);
-        table.getColumnModel().getColumn(2).setPreferredWidth(340);
-        table.getColumnModel().getColumn(3).setPreferredWidth(100);
-        table.getColumnModel().getColumn(4).setPreferredWidth(110);
+        table.getColumnModel().getColumn(1).setPreferredWidth(110);
+        table.getColumnModel().getColumn(2).setPreferredWidth(280);
+        table.getColumnModel().getColumn(COL_STATUS).setPreferredWidth(90);
+        table.getColumnModel().getColumn(COL_PROGRESS).setPreferredWidth(150);
+        table.getColumnModel().getColumn(COL_RESULT).setPreferredWidth(110);
+        table.getColumnModel().getColumn(COL_PROGRESS).setCellRenderer(new ProgressRenderer());
+        table.addMouseListener(new MouseAdapter() {
+            @Override
+            public void mouseClicked(MouseEvent e) {
+                int viewRow = table.rowAtPoint(e.getPoint());
+                int viewCol = table.columnAtPoint(e.getPoint());
+                if (viewRow < 0 || viewCol < 0) return;
+                int modelCol = table.convertColumnIndexToModel(viewCol);
+                if (modelCol != COL_PROGRESS) return;
+                int modelRow = table.convertRowIndexToModel(viewRow);
+                showBreakdown(modelRow);
+            }
+        });
     }
 
     private Border fieldBorder() {
@@ -411,8 +456,17 @@ public class ClientApp extends JFrame {
         head.setOpaque(false);
         head.setBackground(SURFACE);
         head.add(section("JOB HISTORY"), BorderLayout.WEST);
+        JPanel east = new JPanel(new FlowLayout(FlowLayout.RIGHT, 8, 0));
+        east.setOpaque(false);
+        east.setBackground(SURFACE);
         runningLabel.setHorizontalAlignment(SwingConstants.RIGHT);
-        head.add(runningLabel, BorderLayout.EAST);
+        east.add(runningLabel);
+        JButton clearButton = button("Clear finished", false);
+        clearButton.setPreferredSize(new Dimension(140, 30));
+        clearButton.setToolTipText("Remove DONE and FAILED jobs from the history");
+        clearButton.addActionListener(e -> clearFinishedJobs());
+        east.add(clearButton);
+        head.add(east, BorderLayout.EAST);
         panel.add(head, BorderLayout.NORTH);
 
         JScrollPane scroll = new JScrollPane(table);
@@ -454,7 +508,8 @@ public class ClientApp extends JFrame {
         jobDescriptionLabel.setText(switch (op) {
             case MAX -> "Enter integers separated by commas, spaces, or new lines. Returns the largest value.";
             case PRIMECOUNT -> "Enter integers to count. Duplicate prime values are counted separately.";
-            case PRIMESUM -> "Choose an inclusive start and end. Large ranges can take longer to finish.";
+            case PRIMESUM -> "Choose an inclusive start and end (max span "
+                    + JobRequest.MAX_RANGE_SPAN + " values). Large ranges can take longer to finish.";
         });
         inputLayout.show(inputPanel, isRange ? "range" : "numbers");
     }
@@ -468,16 +523,36 @@ public class ClientApp extends JFrame {
 
     private void refreshWorkerCount() {
         if (!workerPollInProgress.compareAndSet(false, true)) return;
+        // Read the connection fields on the EDT (this method runs on it): the
+        // port spinner may hold typed-but-uncommitted text, so flush it here
+        // rather than touching Swing state from the pool thread below.
+        final String host;
+        final int port;
+        try {
+            host = hostField.getText().trim();
+            port = readPort();
+        } catch (IllegalArgumentException e) {
+            workerPollInProgress.set(false);
+            return; // user is mid-edit; retry on the next tick
+        }
         try {
             submitPool.submit(() -> {
                 try {
-                    List<String> workers = service().activeWorkerAddresses();
-                    int n = workers.size();
+                    // Prefer gRPC Bootstrap; fall back to legacy RMI registry.
+                    int n = -1;
+                    try (GrpcClientService grpc = new GrpcClientService(host, port)) {
+                        n = grpc.listWorkers().size();
+                    } catch (RuntimeException grpcDown) {
+                        List<String> workers =
+                                new ClientService(host, port).activeWorkerAddresses();
+                        n = workers.size();
+                    }
+                    int count = n;
                     SwingUtilities.invokeLater(() -> {
-                        statusLabel.setText("●  " + n
-                                + (n == 1 ? " worker online" : " workers online"));
-                        statusLabel.setForeground(n > 0 ? GREEN : MUTED);
-                        statusLabel.setBackground(n > 0
+                        statusLabel.setText("●  " + count
+                                + (count == 1 ? " worker online" : " workers online"));
+                        statusLabel.setForeground(count > 0 ? GREEN : MUTED);
+                        statusLabel.setBackground(count > 0
                                 ? new Color(0xF0FDF4) : new Color(0xF8FAFC));
                         statusLabel.setOpaque(true);
                     });
@@ -505,7 +580,73 @@ public class ClientApp extends JFrame {
     }
 
     private ClientService service() {
-        return new ClientService(hostField.getText().trim(), (Integer) portField.getValue());
+        return new ClientService(hostField.getText().trim(), readPort());
+    }
+
+    private GrpcClientService grpcService() {
+        return new GrpcClientService(hostField.getText().trim(), readPort());
+    }
+
+    private String grpcHost() {
+        return hostField.getText().trim();
+    }
+
+    private int grpcPort() {
+        return readPort();
+    }
+
+    /** Flushes the port editor and validates as a long before narrowing to int. */
+    private int readPort() {
+        return toPort(commitAndReadLong(portField, "port"));
+    }
+
+    /** Raw editor text for a spinner, or null when it has no text editor. */
+    static String editorText(JSpinner spinner) {
+        return (spinner.getEditor() instanceof JSpinner.DefaultEditor defaultEditor)
+                ? defaultEditor.getTextField().getText() : null;
+    }
+
+    /**
+     * Reads a spinner exactly in 64-bit space. The typed text is parsed with
+     * {@link Long#parseLong} first, because {@code commitEdit()} alone goes
+     * through {@code NumberEditor}'s lenient {@code NumberFormat} parser, which
+     * accepts {@code "12x"} as {@code 12} and clamps out-of-range input (e.g.
+     * 23 digits) to {@link Long#MAX_VALUE} without telling the user. The parsed
+     * value is then committed and verified so the model cannot disagree with
+     * the digits the user entered. Must be called on the EDT.
+     */
+    static long commitAndReadLong(JSpinner spinner, String label) {
+        String text = editorText(spinner);
+        long parsed;
+        if (text != null && !text.isBlank()) {
+            try {
+                parsed = Long.parseLong(text.trim());
+            } catch (NumberFormatException e) {
+                throw new IllegalArgumentException(label
+                        + " must be a whole number that fits in 64 bits (got '" + text.trim() + "')");
+            }
+        } else {
+            throw new IllegalArgumentException(label + " must not be empty");
+        }
+        try {
+            spinner.commitEdit();
+        } catch (ParseException e) {
+            throw new IllegalArgumentException(label + " must be a valid integer");
+        }
+        Object value = spinner.getValue();
+        if (!(value instanceof Number number) || number.longValue() != parsed) {
+            throw new IllegalArgumentException(label + " must be a whole number"
+                    + " that fits in 64 bits (got '" + text.trim() + "')");
+        }
+        return parsed;
+    }
+
+    /** Validates a connection port in 64-bit space, then narrows to {@code int}. */
+    static int toPort(long port) {
+        if (port < 1 || port > 65_535) {
+            throw new IllegalArgumentException("port must be between 1 and 65535");
+        }
+        return (int) port;
     }
 
 
@@ -526,7 +667,8 @@ public class ClientApp extends JFrame {
                 numbersArea.setText(numbers.toString().replaceAll("[\\[\\]]", ""));
             }
         } catch (Exception e) {
-            JOptionPane.showMessageDialog(this, "Could not read the selected file.",
+            String detail = e.getMessage() == null ? "" : "\n" + e.getMessage();
+            JOptionPane.showMessageDialog(this, "Could not read the selected file." + detail,
                     "Load failed", JOptionPane.ERROR_MESSAGE);
         }
     }
@@ -538,8 +680,11 @@ public class ClientApp extends JFrame {
         String inputSummary;
         try {
             if (op == ComputeOperation.PRIMESUM) {
-                long start = ((Number) startField.getValue()).longValue();
-                long end = ((Number) endField.getValue()).longValue();
+                // Flush typed-but-uncommitted editor text, read as longs, and
+                // enforce the shared span cap before building the request.
+                long start = commitAndReadLong(startField, "start");
+                long end = commitAndReadLong(endField, "end");
+                JobRequest.checkRangeSpan(start, end);
                 request = JobRequest.primeSum(jobId, start, end);
                 inputSummary = start + "," + end;
             } else if (op == ComputeOperation.MAX) {
@@ -559,17 +704,74 @@ public class ClientApp extends JFrame {
             return;
         }
 
-        int row = addRow(jobId, op, inputSummary);
+        addRow(jobId, op, inputSummary);
         running.incrementAndGet();
         updateRunning();
-        ClientService svc = service();
+        ClientService rmiSvc = service();
+        String host = grpcHost();
+        int port = grpcPort();
         new SwingWorker<Long, Void>() {
             @Override
             protected Long doInBackground() throws Exception {
                 return submitPool.submit(() -> {
+                    // Prefer gRPC (with live progress streaming); fall back to
+                    // legacy RMI when the Bootstrap is not speaking gRPC.
+                    boolean grpcUp;
+                    try (GrpcClientService probe = new GrpcClientService(host, port)) {
+                        grpcUp = probe.isAvailable();
+                    } catch (RuntimeException e) {
+                        grpcUp = false;
+                    }
+                    if (!grpcUp) {
+                        setRmiMode(jobId);
+                        try {
+                            return rmiSvc.submit(request);
+                        } catch (Exception e) {
+                            throw new RuntimeException(e);
+                        }
+                    }
+                    GrpcClientService grpc = new GrpcClientService(host, port);
                     try {
-                        return svc.submit(request);
+                        GrpcClientService.ProgressHandle handle =
+                                grpc.subscribeProgress(request.jobId(),
+                                        new GrpcClientService.ProgressListener() {
+                                            @Override
+                                            public void onUpdate(JobProgressUpdate update) {
+                                                SwingUtilities.invokeLater(
+                                                        () -> updateProgress(jobId, update));
+                                                if (update.getStatus() != JobStatus.JOB_ACTIVE) {
+                                                    // Terminal checkpoint seen: drop the
+                                                    // handle so the stream's own
+                                                    // completion cleans it up.
+                                                    releaseStream(jobId);
+                                                }
+                                            }
+
+                                            @Override
+                                            public void onError(Throwable error) {
+                                                // Keep the submit's own outcome as the
+                                                // source of truth; progress simply stops.
+                                                releaseStream(jobId);
+                                            }
+                                        });
+                        progressHandles.put(jobId, handle);
+                        try {
+                            return grpc.submit(request);
+                        } finally {
+                            // On the happy path the stream keeps running until the
+                            // coordinator sends its terminal checkpoint, so the bar
+                            // and breakdown reflect real task states. Only an
+                            // aborted submit needs the stream torn down now.
+                            releaseStream(jobId);
+                            grpc.close();
+                        }
                     } catch (Exception e) {
+                        releaseStream(jobId);
+                        try {
+                            grpc.close();
+                        } catch (RuntimeException ignored) {
+                            // Best effort.
+                        }
                         throw new RuntimeException(e);
                     }
                 }).get();
@@ -581,11 +783,11 @@ public class ClientApp extends JFrame {
                 updateRunning();
                 try {
                     long result = get();
-                    updateRow(row, "DONE", String.valueOf(result));
+                    updateRow(jobId, "DONE", String.valueOf(result));
                 } catch (Exception e) {
                     Throwable cause = e;
                     while (cause.getCause() != null) cause = cause.getCause();
-                    updateRow(row, "FAILED", cause.getMessage() == null
+                    updateRow(jobId, "FAILED", cause.getMessage() == null
                             ? cause.getClass().getSimpleName() : cause.getMessage());
                 }
             }
@@ -599,17 +801,268 @@ public class ClientApp extends JFrame {
         return numbers.size() + " values " + numbers.subList(0, 3) + "...";
     }
 
-    private int addRow(String jobId, ComputeOperation op, String input) {
-        int row = tableModel.getRowCount();
-        tableModel.addRow(new Object[]{jobId, op, input, "RUNNING", ""});
-        return row;
+    private void addRow(String jobId, ComputeOperation op, String input) {
+        tableModel.addRow(new Object[]{jobId, op, input, "RUNNING", 0, ""});
+        progressByJob.remove(jobId);
+        rmiByJob.remove(jobId);
     }
 
-    private void updateRow(int row, String status, String result) {
+    /** Finds a job's current row by ID. Returns -1 when cleared. Call on the EDT. */
+    private int findRow(String jobId) {
+        for (int row = 0; row < tableModel.getRowCount(); row++) {
+            if (jobId.equals(String.valueOf(tableModel.getValueAt(row, 0)))) return row;
+        }
+        return -1;
+    }
+
+    /** Drops and cancels a job's progress stream handle exactly once. */
+    private void releaseStream(String jobId) {
+        GrpcClientService.ProgressHandle handle = progressHandles.remove(jobId);
+        if (handle != null) {
+            try {
+                handle.cancel();
+            } catch (RuntimeException ignored) {
+                // Best effort.
+            }
+        }
+    }
+
+    private void setRmiMode(String jobId) {
+        rmiByJob.put(jobId, Boolean.TRUE);
         SwingUtilities.invokeLater(() -> {
-            tableModel.setValueAt(status, row, 3);
-            tableModel.setValueAt(result, row, 4);
+            int row = findRow(jobId);
+            if (row >= 0) tableModel.fireTableRowsUpdated(row, row);
         });
+    }
+
+    /** Applies one streamed update: percent from actual completed tasks. */
+    void updateProgress(String jobId, JobProgressUpdate update) {
+        if (update == null) return;
+        int row = findRow(jobId);
+        if (row < 0) return; // cleared from history; nothing to paint
+        if ("DONE".equals(String.valueOf(tableModel.getValueAt(row, COL_STATUS)))) {
+            // The job already finished and its bar was normalised to 100%.
+            // A late in-flight update must never walk a finished bar backwards.
+            return;
+        }
+        progressByJob.put(jobId, update);
+        int percent = (int) Math.round(update.getCompletionFraction() * 100.0);
+        percent = Math.max(0, Math.min(100, percent));
+        tableModel.setValueAt(percent, row, COL_PROGRESS);
+    }
+
+    private void updateRow(String jobId, String status, String result) {
+        SwingUtilities.invokeLater(() -> {
+            int row = findRow(jobId);
+            if (row < 0) return; // cleared from history; nothing to paint
+            tableModel.setValueAt(status, row, COL_STATUS);
+            tableModel.setValueAt(result, row, COL_RESULT);
+            if (!"DONE".equals(status) || rmiByJob.containsKey(jobId)) {
+                return;
+            }
+            // A finished job is 100% by definition. The terminal streamed update
+            // can be lost to the race between submit() returning and the stream
+            // being cancelled, so normalise here rather than leaving the bar
+            // frozen at the last mid-flight percentage (e.g. 67% forever).
+            tableModel.setValueAt(100, row, COL_PROGRESS);
+            progressByJob.compute(jobId, (id, last) ->
+                    last == null ? null : asCompleted(last));
+        });
+    }
+
+    /**
+     * Marks a checkpoint as fully completed, keeping its real task totals. Used
+     * when the client learns the job finished before the terminal stream update
+     * arrived, so the bar, tooltip, and breakdown dialog stay consistent.
+     */
+    static JobProgressUpdate asCompleted(JobProgressUpdate last) {
+        int total = last.getTotalTasks();
+        return last.toBuilder()
+                .setCompletedTasks(total)
+                .setRunningTasks(0)
+                .setPendingTasks(0)
+                .setCompletionFraction(1.0)
+                .setStatus(JobStatus.JOB_COMPLETED)
+                .build();
+    }
+
+    /** Removes DONE/FAILED rows; RUNNING rows (and their live streams) are kept. */
+    private void clearFinishedJobs() {
+        int removed = removeFinishedRows(tableModel, progressByJob, rmiByJob, progressHandles);
+        if (removed > 0) updateRunning();
+    }
+
+    /**
+     * Drops terminal rows from the model plus their progress state and stream
+     * handles. Pure table/map surgery (no frame needed), so it is unit
+     * testable headless. Must be called on the EDT in production: live
+     * writers resolve rows by job ID at paint time, so running jobs are
+     * unaffected by the removal.
+     *
+     * @return number of rows removed
+     */
+    static int removeFinishedRows(DefaultTableModel model,
+                                  Map<String, JobProgressUpdate> progressByJob,
+                                  Map<String, Boolean> rmiByJob,
+                                  Map<String, GrpcClientService.ProgressHandle> handles) {
+        List<String> finished = new ArrayList<>();
+        for (int row = 0; row < model.getRowCount(); row++) {
+            if (!"RUNNING".equals(String.valueOf(model.getValueAt(row, COL_STATUS)))) {
+                finished.add(String.valueOf(model.getValueAt(row, 0)));
+            }
+        }
+        java.util.Set<String> drop = new java.util.HashSet<>(finished);
+        for (String jobId : drop) {
+            progressByJob.remove(jobId);
+            rmiByJob.remove(jobId);
+            GrpcClientService.ProgressHandle handle = handles.remove(jobId);
+            if (handle != null) {
+                try {
+                    handle.cancel();
+                } catch (RuntimeException ignored) {
+                    // Best effort.
+                }
+            }
+        }
+        for (int row = model.getRowCount() - 1; row >= 0; row--) {
+            if (drop.contains(String.valueOf(model.getValueAt(row, 0)))) model.removeRow(row);
+        }
+        return finished.size();
+    }
+
+    /**
+     * Worker-level breakdown for one job. Click the Progress cell to open it.
+     * Shows per-worker rollups plus per-task detail from the latest streamed
+     * checkpoint; refreshes live while the stream advances.
+     */
+    private void showBreakdown(int modelRow) {
+        if (modelRow < 0 || modelRow >= tableModel.getRowCount()) return;
+        String jobId = String.valueOf(tableModel.getValueAt(modelRow, 0));
+        boolean rmi = rmiByJob.containsKey(jobId);
+        JobProgressUpdate snapshot = progressByJob.get(jobId);
+        JDialog dialog = new JDialog(this,
+                "Job progress — " + jobId, false);
+        dialog.setLayout(new BorderLayout(0, 10));
+        dialog.getContentPane().setBackground(SURFACE);
+        JPanel content = new JPanel(new BorderLayout(0, 10));
+        content.setBackground(SURFACE);
+        content.setBorder(BorderFactory.createEmptyBorder(14, 16, 16, 16));
+
+        JLabel summary = new JLabel();
+        summary.setFont(bodyFont);
+        summary.setForeground(TEXT);
+        content.add(summary, BorderLayout.NORTH);
+
+        DefaultTableModel workerModel = new DefaultTableModel(
+                new Object[]{"Worker", "Total", "Done", "Running", "Pending", "Failed"}, 0) {
+            @Override public boolean isCellEditable(int r, int c) { return false; }
+        };
+        JTable workerTable = new JTable(workerModel);
+        workerTable.setFont(bodyFont);
+        workerTable.setRowHeight(Math.max(28, bodyFont.getSize() + 12));
+        JScrollPane workerScroll = new JScrollPane(workerTable);
+        workerScroll.setPreferredSize(new Dimension(520, 130));
+
+        DefaultTableModel taskModel = new DefaultTableModel(
+                new Object[]{"Task", "Part", "Status", "Worker", "Attempt", "Detail"}, 0) {
+            @Override public boolean isCellEditable(int r, int c) { return false; }
+        };
+        JTable taskTable = new JTable(taskModel);
+        taskTable.setFont(bodyFont);
+        taskTable.setRowHeight(Math.max(28, bodyFont.getSize() + 12));
+        JScrollPane taskScroll = new JScrollPane(taskTable);
+        taskScroll.setPreferredSize(new Dimension(520, 200));
+
+        JPanel tables = new JPanel(new BorderLayout(0, 8));
+        tables.setBackground(SURFACE);
+        JLabel workerHead = new JLabel("Per-worker breakdown (live from gRPC stream)");
+        workerHead.setFont(boldFont);
+        workerHead.setForeground(TEXT);
+        tables.add(workerHead, BorderLayout.NORTH);
+        JPanel center = new JPanel(new BorderLayout(0, 8));
+        center.setBackground(SURFACE);
+        center.add(workerScroll, BorderLayout.NORTH);
+        center.add(taskScroll, BorderLayout.CENTER);
+        tables.add(center, BorderLayout.CENTER);
+        content.add(tables, BorderLayout.CENTER);
+
+        JLabel hint = new JLabel("Tip: keep this open while the job runs — it refreshes live.");
+        hint.setFont(bodyFont);
+        hint.setForeground(MUTED);
+        content.add(hint, BorderLayout.SOUTH);
+
+        java.util.concurrent.atomic.AtomicReference<JobProgressUpdate> latest =
+                new java.util.concurrent.atomic.AtomicReference<>(snapshot);
+        java.util.concurrent.atomic.AtomicReference<Timer> refresherRef =
+                new java.util.concurrent.atomic.AtomicReference<>();
+        Runnable refresh = () -> {
+            JobProgressUpdate streamed = progressByJob.get(jobId);
+            if (streamed != null) latest.set(streamed);
+            JobProgressUpdate cur = latest.get();
+            boolean isRmi = rmiByJob.containsKey(jobId);
+            int row = findRow(jobId);
+            String status = row < 0 ? "CLEARED"
+                    : String.valueOf(tableModel.getValueAt(row, COL_STATUS));
+            if (isRmi) {
+                summary.setText("RMI job — no streamed checkpoints. "
+                        + "Connect to the gRPC cluster for live worker detail. "
+                        + "Status: " + status);
+                return;
+            }
+            if (cur == null) {
+                summary.setText("Waiting for the first streamed checkpoint… "
+                        + "Status: " + status);
+                return;
+            }
+            int pct = (int) Math.round(cur.getCompletionFraction() * 100.0);
+            summary.setText(String.format(
+                    "%d/%d tasks complete (%d%%) · running=%d pending=%d failed=%d · status=%s",
+                    cur.getCompletedTasks(), cur.getTotalTasks(), pct,
+                    cur.getRunningTasks(), cur.getPendingTasks(), cur.getFailedTasks(),
+                    cur.getStatus()));
+            workerModel.setRowCount(0);
+            for (var w : cur.getWorkerBreakdownList()) {
+                String worker = w.getWorkerId() < 0 ? "(unassigned)" : String.valueOf(w.getWorkerId());
+                workerModel.addRow(new Object[]{worker, w.getTotalTasks(),
+                        w.getCompletedTasks(), w.getRunningTasks(),
+                        w.getPendingTasks(), w.getFailedTasks()});
+            }
+            taskModel.setRowCount(0);
+            if (cur.hasJobState()) {
+                for (var t : cur.getJobState().getTasksList()) {
+                    String detail = t.getHasResult() ? String.valueOf(t.getResultValue())
+                            : t.getLastFailure();
+                    String worker = t.getAssignedWorkerId() < 0 ? "—"
+                            : String.valueOf(t.getAssignedWorkerId());
+                    taskModel.addRow(new Object[]{t.getTaskId(), t.getPartitionId(),
+                            t.getStatus().name().replace("TASK_", ""), worker,
+                            t.getAttempt(), detail});
+                }
+            }
+        };
+        refresh.run();
+        Timer refresher = new Timer(500, e -> {
+            if (!dialog.isVisible()) return;
+            refresh.run();
+            if (findRow(jobId) < 0) {
+                // History row was cleared: freeze on the last snapshot.
+                summary.setText(summary.getText() + " · cleared from history");
+                Timer t = refresherRef.get();
+                if (t != null) t.stop();
+            }
+        });
+        refresherRef.set(refresher);
+        refresher.start();
+        dialog.addWindowListener(new java.awt.event.WindowAdapter() {
+            @Override public void windowClosed(java.awt.event.WindowEvent e) { refresher.stop(); }
+            @Override public void windowClosing(java.awt.event.WindowEvent e) { refresher.stop(); }
+        });
+
+        dialog.add(content, BorderLayout.CENTER);
+        dialog.setMinimumSize(new Dimension(560, 520));
+        dialog.pack();
+        dialog.setLocationRelativeTo(this);
+        dialog.setVisible(true);
     }
 
     @Override
@@ -617,6 +1070,14 @@ public class ClientApp extends JFrame {
         if (workerPollTimer != null) {
             workerPollTimer.stop();
         }
+        for (GrpcClientService.ProgressHandle handle : progressHandles.values()) {
+            try {
+                handle.cancel();
+            } catch (RuntimeException ignored) {
+                // Best effort.
+            }
+        }
+        progressHandles.clear();
         submitPool.shutdownNow();
         super.dispose();
     }
@@ -727,7 +1188,7 @@ public class ClientApp extends JFrame {
                     } else if ("RUNNING".equals(text)) {
                         label.setForeground(ACCENT);
                     }
-                    if (column == 3) {
+                    if (column == COL_STATUS) {
                         label.setFont(label.getFont().deriveFont(Font.BOLD));
                     }
                     label.setBackground(row % 2 == 0 ? SURFACE : ZEBRA);
@@ -735,6 +1196,58 @@ public class ClientApp extends JFrame {
                 label.setHorizontalAlignment(SwingConstants.LEFT);
             }
             return comp;
+        }
+    }
+
+    /**
+     * Determinate progress bar for the Progress column. Values are Integer
+     * 0-100 from streamed checkpoints; RMI-fallback rows render an
+     * indeterminate bar while RUNNING. The cell tooltip invites the click-through
+     * to the worker breakdown.
+     */
+    private final class ProgressRenderer extends JProgressBar implements TableCellRenderer {
+        private ProgressRenderer() {
+            super(0, 100);
+            setStringPainted(true);
+            setBorderPainted(false);
+            setForeground(ACCENT);
+            setBackground(new Color(0xE2E8F0));
+        }
+
+        @Override
+        public Component getTableCellRendererComponent(JTable table, Object value,
+                boolean selected, boolean focused, int row, int column) {
+            int modelRow = table.convertRowIndexToModel(row);
+            String jobId = String.valueOf(table.getModel().getValueAt(modelRow, 0));
+            boolean rmi = rmiByJob.containsKey(jobId);
+            String status = String.valueOf(table.getModel().getValueAt(modelRow, COL_STATUS));
+            if (rmi) {
+                setIndeterminate("RUNNING".equals(status));
+                setValue("RUNNING".equals(status) ? 50 : 0);
+                setString("RUNNING".equals(status) ? "…" : "n/a");
+                setToolTipText("RMI job — connect to the gRPC cluster for live progress");
+            } else if (value instanceof Number number) {
+                setIndeterminate(false);
+                int pct = Math.max(0, Math.min(100, number.intValue()));
+                setValue(pct);
+                setString(pct + "%");
+                JobProgressUpdate last = progressByJob.get(jobId);
+                if (last != null) {
+                    setToolTipText(String.format(
+                            "%d/%d tasks · running=%d pending=%d — click for worker breakdown",
+                            last.getCompletedTasks(), last.getTotalTasks(),
+                            last.getRunningTasks(), last.getPendingTasks()));
+                } else {
+                    setToolTipText("Waiting for progress stream — click for worker breakdown");
+                }
+            } else {
+                setIndeterminate(false);
+                setValue(0);
+                setString("0%");
+                setToolTipText("Click for worker breakdown");
+            }
+            setCursor(Cursor.getPredefinedCursor(Cursor.HAND_CURSOR));
+            return this;
         }
     }
 }
