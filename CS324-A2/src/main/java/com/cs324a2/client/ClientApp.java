@@ -462,7 +462,7 @@ public class ClientApp extends JFrame {
         runningLabel.setHorizontalAlignment(SwingConstants.RIGHT);
         east.add(runningLabel);
         JButton clearButton = button("Clear finished", false);
-        clearButton.setPreferredSize(new Dimension(140, 30));
+        clearButton.setPreferredSize(new Dimension(fittedWidth(clearButton, "Clear finished"), 30));
         clearButton.setToolTipText("Remove DONE and FAILED jobs from the history");
         clearButton.addActionListener(e -> clearFinishedJobs());
         east.add(clearButton);
@@ -499,6 +499,27 @@ public class ClientApp extends JFrame {
 
     private JButton button(String text, boolean primary) {
         return new FlatButton(text, primary);
+    }
+
+    /**
+     * Width that actually fits a button's own text, including the insets the
+     * look and feel adds around it.
+     *
+     * <p>A fixed width clipped the label ("Clear finish…") on desktops whose
+     * configured font is much larger than the one the size was picked for, and
+     * text width alone still fell short because of the button's insets.
+     */
+    private static int fittedWidth(JButton button, String text) {
+        java.awt.image.BufferedImage probe =
+                new java.awt.image.BufferedImage(1, 1, java.awt.image.BufferedImage.TYPE_INT_ARGB);
+        Graphics2D probeGraphics = probe.createGraphics();
+        try {
+            Insets insets = button.getInsets();
+            int textWidth = probeGraphics.getFontMetrics(button.getFont()).stringWidth(text);
+            return textWidth + insets.left + insets.right + 8;
+        } finally {
+            probeGraphics.dispose();
+        }
     }
 
     private void updateInputs() {
