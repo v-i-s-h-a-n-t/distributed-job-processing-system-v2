@@ -3,7 +3,9 @@ package com.cs324a2.client;
 import static org.junit.jupiter.api.Assertions.assertArrayEquals;
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertThrows;
+import static org.junit.jupiter.api.Assertions.assertTrue;
 
+import com.cs324a2.common.JobRequest;
 import java.io.IOException;
 import java.nio.file.Files;
 import java.nio.file.Path;
@@ -119,6 +121,22 @@ class JobParserTest {
     void loadPrimeSumRangeRejectsFileWithoutRange() throws IOException {
         Path file = write("start,end\n");
         assertThrows(IOException.class, () -> JobParser.loadPrimeSumRange(file.toFile()));
+    }
+
+    @Test
+    void loadPrimeSumRangeAcceptsSpanAtSharedCap() throws IOException {
+        Path file = write("1," + JobRequest.MAX_RANGE_SPAN + "\n");
+        assertArrayEquals(new long[]{1, JobRequest.MAX_RANGE_SPAN},
+                JobParser.loadPrimeSumRange(file.toFile()));
+    }
+
+    @Test
+    void loadPrimeSumRangeRejectsSpanAboveSharedCap() throws IOException {
+        Path file = write("start,end\n1," + (JobRequest.MAX_RANGE_SPAN + 1) + "\n");
+        IOException e = assertThrows(IOException.class,
+                () -> JobParser.loadPrimeSumRange(file.toFile()));
+        assertTrue(e.getMessage().contains("exceeds the maximum"),
+                "CSV rejection should carry the shared span message, got: " + e.getMessage());
     }
 
     private Path write(String content) throws IOException {

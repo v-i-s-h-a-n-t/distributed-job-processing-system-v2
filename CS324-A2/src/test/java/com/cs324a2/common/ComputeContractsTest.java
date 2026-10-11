@@ -96,6 +96,21 @@ class ComputeContractsTest {
     }
 
     @Test
+    void primeSumRangeEnforcesSharedSpanCap() {
+        // Boundary spans are accepted ...
+        assertEquals(JobRequest.MAX_RANGE_SPAN,
+                JobRequest.primeSum("job", 1, JobRequest.MAX_RANGE_SPAN).end());
+        assertEquals(7L, JobRequest.primeSum("job", 7, 7).start());
+        // ... one past the cap is rejected, as are reversed and overflowing ranges.
+        assertThrows(IllegalArgumentException.class,
+                () -> JobRequest.primeSum("job", 1, JobRequest.MAX_RANGE_SPAN + 1));
+        assertThrows(IllegalArgumentException.class,
+                () -> JobRequest.checkRangeSpan(10, 2));
+        assertThrows(IllegalArgumentException.class,
+                () -> JobRequest.primeSum("job", Long.MIN_VALUE, Long.MAX_VALUE));
+    }
+
+    @Test
     void workUnitCarriesJobAndPartitionIdentity() {
         WorkUnit unit = WorkUnit.primeSum("job-7", 3, 100, 150);
 

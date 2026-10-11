@@ -1,5 +1,6 @@
 package com.cs324a2.client;
 
+import com.cs324a2.common.JobRequest;
 import java.io.*;
 import java.util.ArrayList;
 import java.util.List;
@@ -100,8 +101,10 @@ public final class JobParser {
                 try {
                     long start = Long.parseLong(tokens[0].trim());
                     long end = Long.parseLong(tokens[1].trim());
-                    if (start > end) {
-                        throw new IOException("start must not be greater than end in " + file.getName());
+                    try {
+                        JobRequest.checkRangeSpan(start, end);
+                    } catch (IllegalArgumentException e) {
+                        throw new IOException(e.getMessage() + " in " + file.getName(), e);
                     }
                     return new long[]{start, end};
                 } catch (NumberFormatException e) {
