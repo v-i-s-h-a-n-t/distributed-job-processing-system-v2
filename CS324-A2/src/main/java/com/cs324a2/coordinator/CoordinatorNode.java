@@ -1,5 +1,6 @@
 package com.cs324a2.coordinator;
 
+import com.cs324a2.common.ComputeOperation;
 import com.cs324a2.common.JobRequest;
 import com.cs324a2.common.WorkResult;
 import com.cs324a2.common.WorkUnit;
@@ -9,17 +10,25 @@ import com.cs324a2.grpc.bootstrap.WorkerEndpoint;
 import com.cs324a2.grpc.coordinator.CoordinatorJobRequest;
 import com.cs324a2.grpc.coordinator.CoordinatorJobResponse;
 import com.cs324a2.grpc.coordinator.GetCoordinatorStateResponse;
+import com.cs324a2.grpc.coordinator.JobProgressRequest;
+import com.cs324a2.grpc.coordinator.JobProgressUpdate;
 import com.cs324a2.grpc.coordinator.JobSpec;
 import com.cs324a2.grpc.coordinator.JobStateProto;
+import com.cs324a2.grpc.coordinator.JobStatus;
+import com.cs324a2.grpc.coordinator.WorkerProgress;
 import com.cs324a2.scheduler.JobExecutionException;
 import com.cs324a2.scheduler.SchedulerConfig;
 import com.cs324a2.scheduler.WorkerMembership;
 import com.cs324a2.scheduler.WorkerRpcClient;
 import com.cs324a2.worker.WorkerGrpcService;
 import com.cs324a2.worker.WorkerProtoMapper;
+import io.grpc.Context;
 import io.grpc.Server;
 import io.grpc.ServerBuilder;
+import io.grpc.Status;
 import io.grpc.StatusRuntimeException;
+import io.grpc.stub.ServerCallStreamObserver;
+import io.grpc.stub.StreamObserver;
 
 import java.io.IOException;
 import java.time.Duration;
@@ -73,6 +82,10 @@ public final class CoordinatorNode implements AutoCloseable {
     static final long ELECTION_TIMEOUT_JITTER_MILLIS = 500;
     private static final long RPC_TIMEOUT_MILLIS = 800;
     private static final long REPLICATE_TIMEOUT_MILLIS = 1_000;
+    /** Sub-ranges per worker for PRIMESUM, so progress advances smoothly. */
+    static final int RANGE_PARTITIONS_PER_WORKER = 4;
+    /** Upper bound on task count, keeping snapshot replication cost bounded. */
+    static final int MAX_PARTITIONS_PER_JOB = 32;
 
     private final int workerId;
     private final String host;
@@ -325,6 +338,126 @@ public final class CoordinatorNode implements AutoCloseable {
         return response.build();
     }
 
+    /**
+     * Server-streaming progress for the client GUI. Emits one
+     * {@link JobProgressUpdate} per distributed-work mutation (assign, complete,
+     * retry, job-done), derived from actual task checkpoints. Both leaders and
+     * followers can serve it from their local replica, so progress survives
+     * coordinator failover. Completes on terminal job state.
+     */
+    void subscribeJobProgress(JobProgressRequest request,
+                              StreamObserver<JobProgressUpdate> observer) {
+        if (request == null || request.getJobId() == null || request.getJobId().isBlank()) {
+            observer.onError(Status.INVALID_ARGUMENT
+                    .withDescription("job_id must not be blank")
+                    .asRuntimeException());
+            return;
+        }
+        String jobId = request.getJobId();
+        ServerCallStreamObserver<JobProgressUpdate> serverObserver =
+                (observer instanceof ServerCallStreamObserver<?> raw)
+                        ? (ServerCallStreamObserver<JobProgressUpdate>) raw : null;
+        long lastSentProgress = -1;
+        try {
+            while (!closed.get()) {
+                if (Context.current().isCancelled()) return;
+                if (serverObserver != null && serverObserver.isCancelled()) return;
+                ReplicatedJobStore.JobRecord record = store.get(jobId);
+                if (record == null) {
+                    Thread.sleep(50);
+                    continue;
+                }
+                if (record.progressIndex() != lastSentProgress) {
+                    JobProgressUpdate update = toProgressUpdate(record);
+                    observer.onNext(update);
+                    lastSentProgress = record.progressIndex();
+                    if (record.status() != ReplicatedJobStore.JobStatus.ACTIVE) {
+                        observer.onCompleted();
+                        return;
+                    }
+                } else if (record.status() != ReplicatedJobStore.JobStatus.ACTIVE) {
+                    observer.onCompleted();
+                    return;
+                }
+                Thread.sleep(50);
+            }
+        } catch (InterruptedException e) {
+            Thread.currentThread().interrupt();
+        } catch (RuntimeException e) {
+            if (e instanceof StatusRuntimeException) throw e;
+            try {
+                observer.onError(Status.INTERNAL.withCause(e)
+                        .withDescription("progress stream failed")
+                        .asRuntimeException());
+            } catch (RuntimeException ignored) {
+                // Stream already torn down (e.g. client cancelled).
+            }
+        }
+    }
+
+    /**
+     * Builds a progress update from an immutable job snapshot. Counts come
+     * straight from task checkpoints; {@code completion_fraction} is
+     * {@code completed/total} (1.0 for empty jobs).
+     */
+    static JobProgressUpdate toProgressUpdate(ReplicatedJobStore.JobRecord snapshot) {
+        List<ReplicatedJobStore.TaskRecord> tasks = snapshot.tasks();
+        int total = tasks.size();
+        int completed = 0;
+        int running = 0;
+        int pending = 0;
+        int failed = 0;
+        java.util.Map<Integer, int[]> perWorker = new java.util.HashMap<>();
+        for (ReplicatedJobStore.TaskRecord task : tasks) {
+            switch (task.status()) {
+                case COMPLETED -> completed++;
+                case RUNNING -> running++;
+                case FAILED -> failed++;
+                default -> pending++;
+            }
+            int[] counts = perWorker.computeIfAbsent(task.assignedWorkerId(), k -> new int[5]);
+            counts[0]++;
+            switch (task.status()) {
+                case COMPLETED -> counts[1]++;
+                case RUNNING -> counts[2]++;
+                case FAILED -> counts[4]++;
+                default -> counts[3]++;
+            }
+        }
+        double fraction = total == 0 ? 1.0 : completed / (double) total;
+        JobStatus status = switch (snapshot.status()) {
+            case COMPLETED -> JobStatus.JOB_COMPLETED;
+            case FAILED -> JobStatus.JOB_FAILED;
+            default -> JobStatus.JOB_ACTIVE;
+        };
+        JobProgressUpdate.Builder update = JobProgressUpdate.newBuilder()
+                .setJobId(snapshot.jobId())
+                .setTotalTasks(total)
+                .setCompletedTasks(completed)
+                .setRunningTasks(running)
+                .setPendingTasks(pending)
+                .setFailedTasks(failed)
+                .setCompletionFraction(fraction)
+                .setProgressIndex(snapshot.progressIndex())
+                .setStatus(status)
+                .setJobState(CoordinatorJobMapper.toJobProto(snapshot));
+        if (snapshot.resultValue() != null) {
+            update.setResultValue(snapshot.resultValue()).setHasResult(true);
+        }
+        if (snapshot.error() != null) update.setError(snapshot.error());
+        perWorker.entrySet().stream()
+                .sorted(java.util.Map.Entry.comparingByKey())
+                .forEach(entry -> update.addWorkerBreakdown(WorkerProgress.newBuilder()
+                        .setWorkerId(entry.getKey())
+                        .setTotalTasks(entry.getValue()[0])
+                        .setCompletedTasks(entry.getValue()[1])
+                        .setRunningTasks(entry.getValue()[2])
+                        .setPendingTasks(entry.getValue()[3])
+                        .setFailedTasks(entry.getValue()[4])
+                        .build()));
+        return update.build();
+    }
+
     // ---- Election and heartbeats ----
 
     private void tick() {
@@ -469,7 +602,7 @@ public final class CoordinatorNode implements AutoCloseable {
         confirmLeadership();
         long term = getCurrentTerm();
         List<WorkerEndpoint> members = membership.snapshot().workers();
-        int partitions = Math.max(1, members.size());
+        int partitions = partitionCountFor(request, members.size());
         List<WorkUnit> units = WorkPartitioner.partition(request, partitions);
         ReplicatedJobStore.JobRecord admitted;
         if (units.isEmpty()) {
@@ -484,6 +617,27 @@ public final class CoordinatorNode implements AutoCloseable {
                 workerId, admitted.progressIndex(), request.jobId(), term, units.size());
         replicate(admitted.snapshot());
         return runDispatchLoop(request.jobId());
+    }
+
+    /**
+     * How many tasks a job is split into.
+     *
+     * <p>List jobs use one partition per worker. Range jobs are split into
+     * {@link #RANGE_PARTITIONS_PER_WORKER} partitions per worker so that a long
+     * sieve reports many completed sub-ranges: with only one task per worker the
+     * client progress bar could sit at 0% for the whole job and then jump
+     * straight to 100%, which is indistinguishable from a stuck UI. The total is
+     * capped by {@link #MAX_PARTITIONS_PER_JOB} because every task mutation
+     * replicates a full job snapshot to all followers, so replication cost grows
+     * with (tasks x mutations).
+     */
+    static int partitionCountFor(JobRequest request, int memberCount) {
+        int members = Math.max(1, memberCount);
+        if (request.operation() != ComputeOperation.PRIMESUM) {
+            return members;
+        }
+        long desired = (long) members * RANGE_PARTITIONS_PER_WORKER;
+        return (int) Math.min(desired, Math.max(1, MAX_PARTITIONS_PER_JOB));
     }
 
     private long resumeJob(String jobId) throws JobExecutionException {

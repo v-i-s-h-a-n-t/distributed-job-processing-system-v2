@@ -5,6 +5,8 @@ import com.cs324a2.grpc.coordinator.CoordinatorJobResponse;
 import com.cs324a2.grpc.coordinator.CoordinatorServiceGrpc;
 import com.cs324a2.grpc.coordinator.GetCoordinatorStateRequest;
 import com.cs324a2.grpc.coordinator.GetCoordinatorStateResponse;
+import com.cs324a2.grpc.coordinator.JobProgressRequest;
+import com.cs324a2.grpc.coordinator.JobProgressUpdate;
 import com.cs324a2.grpc.coordinator.LeaderHeartbeatRequest;
 import com.cs324a2.grpc.coordinator.LeaderHeartbeatResponse;
 import com.cs324a2.grpc.coordinator.ReplicateJobStateRequest;
@@ -83,5 +85,11 @@ final class CoordinatorServiceImpl
                                     StreamObserver<GetCoordinatorStateResponse> observer) {
         observer.onNext(node.handleGetState());
         observer.onCompleted();
+    }
+
+    @Override
+    public void subscribeJobProgress(JobProgressRequest request,
+                                     StreamObserver<JobProgressUpdate> observer) {
+        node.subscribeJobProgress(request, observer);
     }
 }
