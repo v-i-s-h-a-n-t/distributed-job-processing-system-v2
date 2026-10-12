@@ -45,27 +45,44 @@ Client GUI:
 mvn exec:java -Dexec.mainClass=com.cs324a2.client.ClientApp
 ```
 
-One node logs `*** ELECTED LEADER term=N ***`.
+One node logs `*** BECAME COORDINATOR *** term=N`.
 
 On multiple machines, replace `localhost` in each worker's advertised host with
-its reachable IP address. A worker can also run task execution only, with no
-election duties:
+its reachable IP address.
 
-```bash
-mvn exec:java -Dexec.mainClass=com.cs324a2.worker.WorkerServer -Dexec.args="4 localhost 51004 localhost 50051"
-```
+> Election-capable worker = `CoordinatorServer`. It runs task execution plus
+> the JAC election and job dispatch. `worker.WorkerServer` is task-only: it
+> executes subtasks but never stands for election (no JAC, no
+> `CoordinatorService`).
 
 ## Services
 
 `bootstrap.proto` tracks live workers with `RegisterWorker`, `Heartbeat`,
-`DeregisterWorker`, `ListWorkers`, and the `WatchMembership` stream. Workers
-heartbeat every 2 seconds and are dropped after 8 seconds of silence.
+`DeregisterWorker`, `ListWorkers` (= suggested `GetActiveWorkers`),
+`GetRandomWorker` (uniform draw for unstructured joins), and the
+`WatchMembership` stream. Workers heartbeat every 2 seconds and are dropped
+after 8 seconds of silence.
 
-`worker.proto` exposes `ExecuteTask`, which runs one partition.
+`worker.proto` exposes `ExecuteTask`, which runs one partition, plus `Ping`
+(liveness probe, suggested `Heartbeat`/`Ping`).
 
-`coordinator.proto` covers election and dispatch: `RequestVote`,
-`LeaderHeartbeat`, `ReplicateJobState`, `SubmitJob`, `GetCoordinatorState`, and
-`SubscribeJobProgress`.
+`coordinator.proto` covers election and dispatch: `AddNeighbor`
+(= suggested `Join`/`AddNeighbour`), `PropagateElection` (= `Election`),
+`PropagateCoordinator` (= `Coordinator`), `Ping`, `RequestVote` (legacy,
+retained), `LeaderHeartbeat`, `ReplicateJobState` (= suggested
+`ReplicateState`), `SubmitJob` (= `SubmitJob`), `GetCoordinatorState`
+(= `FetchState`/`GetResult`), and `SubscribeJobProgress`
+(= `StreamProgress`, server streaming).
+
+Suggested-§5 → actual mapping:
+
+| Suggested | Actual |
+|---|---|
+| `BootstrapService/Register`, `Deregister`, `GetActiveWorkers`, `GetRandomWorker` | `RegisterWorker`, `DeregisterWorker`, `GetActiveWorkers` (= `ListWorkers`), `GetRandomWorker` |
+| `ElectionService/Election`, `Coordinator` | `CoordinatorService/PropagateElection`, `PropagateCoordinator` |
+| `WorkerService/Join`/`AddNeighbour`, `Heartbeat`/`Ping`, `ExecuteSubtask` | `AddNeighbor`, `Ping` (both services), `ExecuteTask` |
+| `JobService/SubmitJob`, `StreamProgress`, `GetResult` | `SubmitJob`, `SubscribeJobProgress`, `GetCoordinatorState` + submit response |
+| `StateService/ReplicateState`, `FetchState` | `ReplicateJobState`, `GetCoordinatorState` |
 
 ## Client GUI
 
@@ -104,25 +121,51 @@ The sieve handles endpoints up to 2,500,000,000,000,000. Sums that overflow a
 ### Workers
 
 Bootstrap drops a worker after 8 seconds without a heartbeat and broadcasts the
-removal. Failed tasks are retried elsewhere up to
+removal. Each coordinator node also watches the membership stream and prunes
+departed workers from its neighbour list, and drops a neighbour after 3
+consecutive election/heartbeat RPC failures — so floods stop dialling dead
+peers while the job continues. Failed tasks are retried elsewhere up to
 `SchedulerConfig.maximumAttempts`. Work left RUNNING by a dead worker returns to
-PENDING and is reassigned. New workers can join mid-job.
+PENDING and is reassigned. New workers can join mid-job (register + link to a
+random active worker).
+
+Detection values (chosen for a lab LAN; all configurable): leader heartbeat
+150 ms, follower election timeout 500–1000 ms randomised (distinguishes a slow
+worker, which still heartbeats in time, from a failed one, which misses the
+whole window); Bootstrap heartbeat 2 s, expiry 8 s (≈4 missed heartbeats:
+suspect after ~2 misses, confirmed failed at 4); neighbour link dropped after 3
+consecutive RPC failures.
 
 ### Coordinator
 
-Election is Raft-style over gRPC:
+Election is the Assignment-1 unstructured JAC flood over gRPC:
 
-- Monotonic terms. Stale terms are rejected, higher terms force a step down.
-- One vote per term. A candidate needs a majority of the membership and must be
-  at least as up to date as the voter, judged by the replicated progress
-  watermark.
-- Leader heartbeats every 150 ms. Followers start an election after 500 to
-  1000 ms without one.
-- Split-brain protection: only the first leader per term is recognised, votes
-  are denied while a live leader holds the term, and job admission needs a
-  majority lease. Leaders recheck leadership mid-job and abort on loss.
-- Every mutation (admit, assign, complete, retry, done) takes the next global
-  progress number and is replicated to followers with `ReplicateJobState`.
+- Workers form an unstructured overlay (each node links to a subset of peers;
+  a joining node links to one random active worker, bilaterally).
+- When no live coordinator holds the term, any worker may initiate: an
+  `ELECTION` message floods neighbours-except-sender, duplicates are ignored
+  via `seenElectionIds`, and each subtree convergecasts its best candidate, so
+  all reachable active workers are considered.
+- Winner = lowest Job Allocation Counter (JAC); ties break to the highest
+  worker ID.
+- The winner is announced with a `COORDINATOR` flood (`seenCoordinatorIds`
+  dedup) so every reachable worker installs the same leader; stale terms are
+  rejected and same-term conflicts merge deterministically to the better JAC
+  candidate, giving one coordinator per term.
+- One term serves at most 5 jobs (`MAX_JOBS_PER_TERM`): admissions increment
+  JAC + term count; the 5th admission closes the term; once in-flight jobs
+  drain, the leader steps down and a new election runs. A term also ends early
+  if the coordinator fails (heartbeat timeout → new election).
+- JAC durability (§7.3): each node owns its counter (survives on the node;
+  elections read live values through the flood, so no stale copy can win);
+  the leader's JAC rides on every heartbeat and all of
+  JAC / jobs-this-term / leader JAC / neighbours are exposed via
+  `GetCoordinatorState`. Job state itself (term, specs, subtask assignments,
+  attempts, completed results, progress numbers, job IDs) is replicated to
+  followers on every mutation with `ReplicateJobState`.
+- Split-brain protection: monotonic terms, only the first/best leader per term
+  is recognised, job admission needs a majority heartbeat lease, leaders
+  recheck leadership mid-job and abort on loss.
 - A new leader restores those snapshots, reclaims RUNNING tasks, keeps COMPLETED
   results, and resumes unfinished jobs without client help.
 
@@ -140,8 +183,9 @@ Tests cover the gRPC membership, scheduling, progress, client, and coordinator
 recovery paths. Targeted runs:
 
 ```bash
-mvn -Dtest=BootstrapGrpcServiceTest test    # membership, leases, watch stream
-mvn -Dtest=CoordinatorElectionTest test     # terms, votes, split-brain
+mvn -Dtest=BootstrapGrpcServiceTest test    # membership, leases, watch stream, random draw
+mvn -Dtest=CoordinatorElectionTest test     # terms, votes, split-brain (legacy handlers)
+mvn -Dtest=JacElectionTest test             # JAC rule, dedup, agreement, pruning, 5-job rotation
 mvn -Dtest=CoordinatorFailoverTest test     # kill the leader mid-job
 mvn -Dtest=CoordinatorProgressTest test     # progress streaming
 mvn -Dtest=GrpcClientServiceTest test       # discovery, submit, progress

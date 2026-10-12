@@ -3,6 +3,8 @@ package com.cs324a2.bootstrap;
 import com.cs324a2.grpc.bootstrap.BootstrapServiceGrpc;
 import com.cs324a2.grpc.bootstrap.DeregisterWorkerRequest;
 import com.cs324a2.grpc.bootstrap.DeregisterWorkerResponse;
+import com.cs324a2.grpc.bootstrap.GetRandomWorkerRequest;
+import com.cs324a2.grpc.bootstrap.GetRandomWorkerResponse;
 import com.cs324a2.grpc.bootstrap.HeartbeatRequest;
 import com.cs324a2.grpc.bootstrap.HeartbeatResponse;
 import com.cs324a2.grpc.bootstrap.ListWorkersRequest;
@@ -184,6 +186,40 @@ public final class BootstrapGrpcService
                     .addAllActiveWorkers(activeSnapshotLocked())
                     .setMembershipVersion(membershipVersion)
                     .build();
+        }
+        responseObserver.onNext(response);
+        responseObserver.onCompleted();
+    }
+
+    /** Suggested §5 GetActiveWorkers: alias for ListWorkers. */
+    @Override
+    public void getActiveWorkers(
+            ListWorkersRequest request,
+            StreamObserver<ListWorkersResponse> responseObserver) {
+        listWorkers(request, responseObserver);
+    }
+
+    /** Suggested §5 GetRandomWorker: uniform draw over active workers. */
+    @Override
+    public void getRandomWorker(
+            GetRandomWorkerRequest request,
+            StreamObserver<GetRandomWorkerResponse> responseObserver) {
+        GetRandomWorkerResponse response;
+        synchronized (membershipLock) {
+            expireWorkersLocked();
+            List<WorkerEndpoint> candidates = activeSnapshotLocked().stream()
+                    .filter(w -> w.getWorkerId() != request.getExcludeWorkerId())
+                    .toList();
+            if (candidates.isEmpty()) {
+                response = GetRandomWorkerResponse.newBuilder()
+                        .setFound(false).build();
+            } else {
+                WorkerEndpoint pick = candidates.get(
+                        java.util.concurrent.ThreadLocalRandom.current()
+                                .nextInt(candidates.size()));
+                response = GetRandomWorkerResponse.newBuilder()
+                        .setFound(true).setWorker(pick).build();
+            }
         }
         responseObserver.onNext(response);
         responseObserver.onCompleted();

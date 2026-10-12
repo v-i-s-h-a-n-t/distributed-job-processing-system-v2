@@ -8,6 +8,9 @@ option java_outer_classname = "WorkerProto";
 
 service WorkerService {
   rpc ExecuteTask(ExecuteTaskRequest) returns (ExecuteTaskResponse);
+  // Liveness probe (suggested §5 Ping). Task-only WorkerServers answer
+  // even though they never stand for election.
+  rpc Ping(PingRequest) returns (PingResponse);
 }
 
 enum Operation {
@@ -47,4 +50,13 @@ message ExecuteTaskResponse {
   int32 worker_id = 5;
   Operation operation = 6;
   int64 value = 7;
+}
+
+message PingRequest {
+  int32 caller_id = 1;
+}
+
+message PingResponse {
+  int32 worker_id = 1;
+  bool accepting = 2;
 }

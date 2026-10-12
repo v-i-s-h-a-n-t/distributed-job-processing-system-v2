@@ -4,6 +4,8 @@ import com.cs324a2.common.WorkResult;
 import com.cs324a2.common.WorkUnit;
 import com.cs324a2.grpc.worker.ExecuteTaskRequest;
 import com.cs324a2.grpc.worker.ExecuteTaskResponse;
+import com.cs324a2.grpc.worker.PingRequest;
+import com.cs324a2.grpc.worker.PingResponse;
 import com.cs324a2.grpc.worker.WorkerServiceGrpc;
 import io.grpc.Context;
 import io.grpc.Status;
@@ -111,9 +113,17 @@ public final class WorkerGrpcService extends WorkerServiceGrpc.WorkerServiceImpl
         }
     }
 
+    /** Suggested §5 Ping: liveness probe, works even when not accepting. */
     @Override
-    public void close() {
-        if (!closed.compareAndSet(false, true)) return;
+    public void ping(PingRequest request,
+                     StreamObserver<PingResponse> observer) {
+        observer.onNext(PingResponse.newBuilder()
+                .setWorkerId(workerId).setAccepting(accepting.get()).build());
+        observer.onCompleted();
+    }
+
+    @Override
+    public void close() {        if (!closed.compareAndSet(false, true)) return;
         stopAccepting();
         executor.shutdown();
         try {

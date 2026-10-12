@@ -6,7 +6,9 @@ option java_multiple_files = true;
 option java_package = "com.cs324a2.grpc.coordinator";
 option java_outer_classname = "CoordinatorProto";
 
-// Raft-style gRPC term, voting, heartbeat, and replicated job-state contract.
+// Raft-style gRPC term, voting, heartbeat, and replicated job-state contract,
+// plus the Assignment-1 unstructured ELECTION/COORDINATOR flood (JAC-based)
+// re-expressed over gRPC.
 service CoordinatorService {
   // One vote per term. Candidate wins only with a majority of known members.
   rpc RequestVote(RequestVoteRequest) returns (RequestVoteResponse);
@@ -33,6 +35,20 @@ service CoordinatorService {
   // serve their replicated snapshot so progress survives coordinator failover.
   // The stream completes when the job reaches a terminal state.
   rpc SubscribeJobProgress(JobProgressRequest) returns (stream JobProgressUpdate);
+
+  // ---- Assignment-1 unstructured election over gRPC ----
+  // Bidirectional neighbour link for the unstructured overlay.
+  // (Suggested §5 Join/AddNeighbour.)
+  rpc AddNeighbor(NeighborRequest) returns (NeighborResponse);
+  // ELECTION flood (convergecast): returns the best candidate in this
+  // node's reached subtree. Duplicate election_ids return duplicate=true.
+  // (Suggested §5 Election.)
+  rpc PropagateElection(ElectionRequest) returns (ElectionResponse);
+  // COORDINATOR flood: informs all reachable workers of the elected leader.
+  // (Suggested §5 Coordinator.)
+  rpc PropagateCoordinator(CoordinatorAnnounce) returns (CoordinatorAck);
+  // Liveness probe. (Suggested §5 Heartbeat/Ping.)
+  rpc Ping(PingRequest) returns (PingResponse);
 }
 
 enum Operation {
@@ -117,6 +133,9 @@ message LeaderHeartbeatRequest {
   string leader_host = 3;
   int32 leader_port = 4;
   int64 commit_progress_index = 5;
+  // Leader's JAC at send time, so followers learn it for same-term merges
+  // and operators can observe it via GetCoordinatorState.
+  int32 leader_jac = 6;
 }
 
 message LeaderHeartbeatResponse {
@@ -167,13 +186,18 @@ message GetCoordinatorStateResponse {
   int64 commit_progress_index = 4;
   repeated JobStateProto jobs = 5;
   int32 worker_id = 6;
+  // JAC durability / observability (§7.3): each node owns its own JAC
+  // (survives on the node itself; elections read live values via flood).
+  int32 jac = 7;
+  int32 jobs_in_current_term = 8;
+  int32 leader_jac = 9;
+  repeated int32 neighbor_ids = 10;
 }
 
 // Subscribes to real-time progress for one job. Empty job_id is rejected.
 message JobProgressRequest {
   string job_id = 1;
 }
-
 // Per-worker rollup of the tasks currently assigned to that worker.
 // worker_id is -1 for tasks not yet assigned to any worker.
 message WorkerProgress {
@@ -203,4 +227,68 @@ message JobProgressUpdate {
   // Full checkpoint snapshot so clients can render per-task detail.
   JobStateProto job_state = 13;
   repeated WorkerProgress worker_breakdown = 14;
+}
+
+// ---- Unstructured overlay + JAC election (Assignment 1 over gRPC) ----
+
+// Neighbour link request. Carries the caller's endpoint so the link is bilateral.
+message NeighborRequest {
+  int32 worker_id = 1;
+  string host = 2;
+  int32 port = 3;
+}
+
+message NeighborResponse {
+  bool added = 1;
+  int32 neighbor_count = 2;
+}
+
+// ELECTION flood message. Forwarded to all neighbours except the sender;
+// each node returns the best candidate in its reached subtree.
+message ElectionRequest {
+  string election_id = 1;
+  int32 sender_id = 2;
+  string sender_host = 3;
+  int32 sender_port = 4;
+}
+
+// Convergecast reply. duplicate=true means this election_id was already
+// processed here, so the caller must ignore best_* fields.
+message ElectionResponse {
+  bool duplicate = 1;
+  int32 best_worker_id = 2;
+  int32 best_jac = 3;
+  string best_host = 4;
+  int32 best_port = 5;
+  int64 term = 6;
+}
+
+// COORDINATOR announcement flood. Informs every reachable worker of the
+// elected leader for the term.
+message CoordinatorAnnounce {
+  string coordinator_message_id = 1;
+  int32 coordinator_id = 2;
+  string coordinator_host = 3;
+  int32 coordinator_port = 4;
+  int32 coordinator_jac = 5;
+  int64 term = 6;
+  int32 sender_id = 7;
+  string sender_host = 8;
+  int32 sender_port = 9;
+}
+
+message CoordinatorAck {
+  bool accepted = 1;
+  int64 term = 2;
+}
+
+// Liveness probe (suggested §5 Ping).
+message PingRequest {
+  int32 caller_id = 1;
+}
+
+message PingResponse {
+  int32 worker_id = 1;
+  bool is_leader = 2;
+  int64 term = 3;
 }

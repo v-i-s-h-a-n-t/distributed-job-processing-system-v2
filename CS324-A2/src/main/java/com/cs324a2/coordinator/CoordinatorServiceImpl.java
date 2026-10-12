@@ -1,14 +1,22 @@
 package com.cs324a2.coordinator;
 
+import com.cs324a2.grpc.coordinator.CoordinatorAck;
+import com.cs324a2.grpc.coordinator.CoordinatorAnnounce;
 import com.cs324a2.grpc.coordinator.CoordinatorJobRequest;
 import com.cs324a2.grpc.coordinator.CoordinatorJobResponse;
 import com.cs324a2.grpc.coordinator.CoordinatorServiceGrpc;
+import com.cs324a2.grpc.coordinator.ElectionRequest;
+import com.cs324a2.grpc.coordinator.ElectionResponse;
 import com.cs324a2.grpc.coordinator.GetCoordinatorStateRequest;
 import com.cs324a2.grpc.coordinator.GetCoordinatorStateResponse;
 import com.cs324a2.grpc.coordinator.JobProgressRequest;
 import com.cs324a2.grpc.coordinator.JobProgressUpdate;
 import com.cs324a2.grpc.coordinator.LeaderHeartbeatRequest;
 import com.cs324a2.grpc.coordinator.LeaderHeartbeatResponse;
+import com.cs324a2.grpc.coordinator.NeighborRequest;
+import com.cs324a2.grpc.coordinator.NeighborResponse;
+import com.cs324a2.grpc.coordinator.PingRequest;
+import com.cs324a2.grpc.coordinator.PingResponse;
 import com.cs324a2.grpc.coordinator.ReplicateJobStateRequest;
 import com.cs324a2.grpc.coordinator.ReplicateJobStateResponse;
 import com.cs324a2.grpc.coordinator.RequestVoteRequest;
@@ -49,7 +57,7 @@ final class CoordinatorServiceImpl
         CoordinatorNode.HeartbeatOutcome outcome = node.handleHeartbeat(
                 request.getTerm(), request.getLeaderId(),
                 request.getLeaderHost(), request.getLeaderPort(),
-                request.getCommitProgressIndex());
+                request.getCommitProgressIndex(), request.getLeaderJac());
         observer.onNext(LeaderHeartbeatResponse.newBuilder()
                 .setTerm(outcome.term())
                 .setSuccess(outcome.accepted())
@@ -90,5 +98,36 @@ final class CoordinatorServiceImpl
     public void subscribeJobProgress(JobProgressRequest request,
                                      StreamObserver<JobProgressUpdate> observer) {
         node.subscribeJobProgress(request, observer);
+    }
+
+    @Override
+    public void addNeighbor(NeighborRequest request,
+                            StreamObserver<NeighborResponse> observer) {
+        boolean added = node.handleAddNeighbor(
+                request.getWorkerId(), request.getHost(), request.getPort());
+        observer.onNext(NeighborResponse.newBuilder()
+                .setAdded(added).setNeighborCount(node.getNeighbors().size()).build());
+        observer.onCompleted();
+    }
+
+    @Override
+    public void propagateElection(ElectionRequest request,
+                                  StreamObserver<ElectionResponse> observer) {
+        observer.onNext(node.handlePropagateElection(request));
+        observer.onCompleted();
+    }
+
+    @Override
+    public void propagateCoordinator(CoordinatorAnnounce request,
+                                     StreamObserver<CoordinatorAck> observer) {
+        observer.onNext(node.handlePropagateCoordinator(request));
+        observer.onCompleted();
+    }
+
+    @Override
+    public void ping(PingRequest request,
+                     StreamObserver<PingResponse> observer) {
+        observer.onNext(node.handlePing(request.getCallerId()));
+        observer.onCompleted();
     }
 }

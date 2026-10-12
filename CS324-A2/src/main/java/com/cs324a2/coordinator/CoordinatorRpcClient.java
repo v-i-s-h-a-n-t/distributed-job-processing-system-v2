@@ -1,10 +1,18 @@
 package com.cs324a2.coordinator;
 
+import com.cs324a2.grpc.coordinator.CoordinatorAck;
+import com.cs324a2.grpc.coordinator.CoordinatorAnnounce;
 import com.cs324a2.grpc.coordinator.CoordinatorJobRequest;
 import com.cs324a2.grpc.coordinator.CoordinatorJobResponse;
 import com.cs324a2.grpc.coordinator.CoordinatorServiceGrpc;
+import com.cs324a2.grpc.coordinator.ElectionRequest;
+import com.cs324a2.grpc.coordinator.ElectionResponse;
 import com.cs324a2.grpc.coordinator.LeaderHeartbeatRequest;
 import com.cs324a2.grpc.coordinator.LeaderHeartbeatResponse;
+import com.cs324a2.grpc.coordinator.NeighborRequest;
+import com.cs324a2.grpc.coordinator.NeighborResponse;
+import com.cs324a2.grpc.coordinator.PingRequest;
+import com.cs324a2.grpc.coordinator.PingResponse;
 import com.cs324a2.grpc.coordinator.ReplicateJobStateRequest;
 import com.cs324a2.grpc.coordinator.ReplicateJobStateResponse;
 import com.cs324a2.grpc.coordinator.RequestVoteRequest;
@@ -53,6 +61,29 @@ final class CoordinatorRpcClient implements AutoCloseable {
                                   long timeoutMillis) {
         return stubFor(host, port).withDeadlineAfter(timeoutMillis, TimeUnit.MILLISECONDS)
                 .submitJob(request);
+    }
+
+    NeighborResponse addNeighbor(String host, int port, NeighborRequest request,
+                                 long timeoutMillis) {
+        return stubFor(host, port).withDeadlineAfter(timeoutMillis, TimeUnit.MILLISECONDS)
+                .addNeighbor(request);
+    }
+
+    ElectionResponse propagateElection(String host, int port, ElectionRequest request,
+                                       long timeoutMillis) {
+        return stubFor(host, port).withDeadlineAfter(timeoutMillis, TimeUnit.MILLISECONDS)
+                .propagateElection(request);
+    }
+
+    CoordinatorAck propagateCoordinator(String host, int port, CoordinatorAnnounce request,
+                                        long timeoutMillis) {
+        return stubFor(host, port).withDeadlineAfter(timeoutMillis, TimeUnit.MILLISECONDS)
+                .propagateCoordinator(request);
+    }
+
+    PingResponse ping(String host, int port, int callerId, long timeoutMillis) {
+        return stubFor(host, port).withDeadlineAfter(timeoutMillis, TimeUnit.MILLISECONDS)
+                .ping(PingRequest.newBuilder().setCallerId(callerId).build());
     }
 
     private CoordinatorServiceGrpc.CoordinatorServiceBlockingStub stubFor(String host, int port) {

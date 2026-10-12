@@ -28,6 +28,15 @@ service BootstrapService {
   // Sends the current membership snapshot, then streams worker join and leave events. If the stream disconnects, reconnect and request a fresh snapshot.
   rpc WatchMembership(WatchMembershipRequest)
       returns (stream MembershipEvent);
+
+  // Returns one randomly chosen active worker. Thin convenience over the
+  // active list so joining workers can link to a random peer (§2.1).
+  rpc GetRandomWorker(GetRandomWorkerRequest)
+      returns (GetRandomWorkerResponse);
+
+  // Alias for ListWorkers (suggested §5 GetActiveWorkers).
+  rpc GetActiveWorkers(ListWorkersRequest)
+      returns (ListWorkersResponse);
 }
 
 // Network address and registration identity for a worker process.
@@ -133,4 +142,15 @@ message MembershipEvent {
 
   // Increasing membership version. Clients can detect if they missed events.
   int64 membership_version = 4;
+}
+
+// Random-peer helper for unstructured joins (§2.1).
+message GetRandomWorkerRequest {
+  // Caller is excluded from the draw when set (> 0).
+  int32 exclude_worker_id = 1;
+}
+
+message GetRandomWorkerResponse {
+  bool found = 1;
+  WorkerEndpoint worker = 2;
 }

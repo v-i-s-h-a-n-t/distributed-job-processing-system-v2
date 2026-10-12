@@ -2,6 +2,7 @@ package com.cs324a2.bootstrap;
 
 import com.cs324a2.grpc.bootstrap.BootstrapServiceGrpc;
 import com.cs324a2.grpc.bootstrap.DeregisterWorkerRequest;
+import com.cs324a2.grpc.bootstrap.GetRandomWorkerRequest;
 import com.cs324a2.grpc.bootstrap.HeartbeatRequest;
 import com.cs324a2.grpc.bootstrap.ListWorkersRequest;
 import com.cs324a2.grpc.bootstrap.MembershipEvent;
@@ -88,6 +89,26 @@ public final class BootstrapClient implements AutoCloseable {
                 .listWorkers(ListWorkersRequest.getDefaultInstance());
         return new WorkerSnapshot(response.getActiveWorkersList(),
                 response.getMembershipVersion());
+    }
+
+    /** Suggested §5 GetActiveWorkers: alias for ListWorkers. */
+    public WorkerSnapshot getActiveWorkers() {
+        var response = blockingStub.withDeadlineAfter(
+                        DEFAULT_DEADLINE_SECONDS, TimeUnit.SECONDS)
+                .getActiveWorkers(ListWorkersRequest.getDefaultInstance());
+        return new WorkerSnapshot(response.getActiveWorkersList(),
+                response.getMembershipVersion());
+    }
+
+    /** Suggested §5 GetRandomWorker: uniform draw, excluding the caller. */
+    public java.util.Optional<WorkerEndpoint> getRandomWorker(int excludeWorkerId) {
+        var response = blockingStub.withDeadlineAfter(
+                        DEFAULT_DEADLINE_SECONDS, TimeUnit.SECONDS)
+                .getRandomWorker(GetRandomWorkerRequest.newBuilder()
+                        .setExcludeWorkerId(excludeWorkerId).build());
+        return response.getFound()
+                ? java.util.Optional.of(response.getWorker())
+                : java.util.Optional.empty();
     }
 
     /** Starts a watch; the server sends a snapshot followed by live changes. */

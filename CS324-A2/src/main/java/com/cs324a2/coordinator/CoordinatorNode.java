@@ -35,7 +35,9 @@ import java.time.Duration;
 import java.util.ArrayList;
 import java.util.Comparator;
 import java.util.List;
+import java.util.Set;
 import java.util.concurrent.ConcurrentHashMap;
+import java.util.concurrent.CopyOnWriteArrayList;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
 import java.util.concurrent.Future;
@@ -54,19 +56,28 @@ import java.util.concurrent.ThreadLocalRandom;
  * duties ({@code CoordinatorService}) on one gRPC port, so every election RPC
  * (terms, votes, heartbeats, replication, submit) travels over gRPC.
  *
- * <p>Election is Raft-style:
+ * <p>Election is the Assignment-1 unstructured flood, re-expressed over gRPC:
  * <ul>
- *   <li>Monotonic leader {@code terms}; one vote per term per node.</li>
- *   <li>Voters prefer candidates whose replicated progress watermark is at
- *       least as advanced as their own, so the winner can restore state.</li>
- *   <li>Majority quorum of the current membership wins.</li>
- *   <li>Leaders send periodic heartbeats; followers start an election after a
- *       randomized timeout without a valid heartbeat.</li>
- *   <li>Split-brain protection: stale terms are rejected, only the first
- *       leader per term is recognised, votes are denied while a live leader
- *       holds the term, and job admission requires a majority heartbeat
- *       lease.</li>
+ *   <li>Workers form an unstructured overlay: each node links to a subset of
+ *       peers ({@code neighbours}); a joining node connects to one random
+ *       active worker (bilateral {@code AddNeighbor}).</li>
+ *   <li>When no coordinator is active any worker may initiate an election.
+ *       An {@code ELECTION} message floods the overlay (neighbours except
+ *       sender); duplicates are ignored via {@code seenElectionIds}.</li>
+ *   <li>Convergecast returns the best candidate of each reached subtree; all
+ *       reachable active workers are considered.</li>
+ *   <li>Lowest Job Allocation Counter (JAC) wins; ties break to the highest
+ *       worker ID.</li>
+ *   <li>The winner is announced with a {@code COORDINATOR} flood so every
+ *       reachable worker eventually agrees on one leader per term.</li>
+ *   <li>A leader serves one term of at most {@code MAX_JOBS_PER_TERM} jobs;
+ *       in-flight jobs finish first, then a new election is triggered.</li>
  * </ul>
+ *
+ * <p>Monotonic leader {@code terms} are kept for agreement (stale terms are
+ * rejected, only the first leader per term is recognised). The legacy
+ * Raft-style {@code RequestVote} quorum handlers are retained for
+ * compatibility but the JAC flood is the primary election path.
  *
  * <p>Job checkpoints (job spec, per-task states, results, progress event
  * numbers) are replicated to followers on every mutation. A newly elected
@@ -81,6 +92,8 @@ public final class CoordinatorNode implements AutoCloseable {
     static final long ELECTION_TIMEOUT_JITTER_MILLIS = 500;
     private static final long RPC_TIMEOUT_MILLIS = 800;
     private static final long REPLICATE_TIMEOUT_MILLIS = 1_000;
+    /** One coordinator term serves at most this many jobs (Assignment 1). */
+    public static final int MAX_JOBS_PER_TERM = 5;
     /** Sub-ranges per worker for PRIMESUM, so progress advances smoothly. */
     static final int RANGE_PARTITIONS_PER_WORKER = 4;
     /** Upper bound on task count, keeping snapshot replication cost bounded. */
@@ -103,6 +116,8 @@ public final class CoordinatorNode implements AutoCloseable {
     private long currentTerm;
     private Integer votedFor;
     private Integer leaderId;
+    /** JAC of the recognised leader; used for deterministic same-term merges. */
+    private int leaderJac = Integer.MAX_VALUE;
     private boolean isLeader;
     private volatile long lastHeartbeatNanos = System.nanoTime();
     private final long electionTimeoutMillis =
@@ -111,6 +126,29 @@ public final class CoordinatorNode implements AutoCloseable {
     private volatile long lastHeartbeatSentNanos;
     private final AtomicBoolean electionInProgress = new AtomicBoolean();
     private final AtomicBoolean closed = new AtomicBoolean();
+
+    // ---- Assignment-1 JAC election state (unstructured flood over gRPC) ----
+    /** Job Allocation Counter: incremented per job assigned as coordinator. */
+    private final AtomicInteger jac = new AtomicInteger(0);
+    private final AtomicInteger jobsInCurrentTerm = new AtomicInteger(0);
+    private final Object termStateLock = new Object();
+    private boolean termClosing = false;
+    private boolean termTransitionStarted = false;
+    private int inFlightJobs = 0;
+    private final AtomicLong electionSeq = new AtomicLong(0);
+    private final Set<String> seenElectionIds = ConcurrentHashMap.newKeySet();
+    private final Set<String> seenCoordinatorIds = ConcurrentHashMap.newKeySet();
+    private final Object electionLock = new Object();
+    /** Unstructured overlay: subset of peers this node forwards to. */
+    private final CopyOnWriteArrayList<WorkerEndpoint> neighbors =
+            new CopyOnWriteArrayList<>();
+    /** Consecutive RPC failures per neighbour; drop at threshold (§7.1). */
+    private final ConcurrentHashMap<Integer, AtomicInteger> neighborFailures =
+            new ConcurrentHashMap<>();
+    /** Neighbours are dropped after this many consecutive failures. */
+    static final int MAX_NEIGHBOR_FAILURES = 3;
+    private volatile Thread membershipWatcher;
+    private final AtomicLong membershipWatcherVersion = new AtomicLong(-1);
 
     private final ScheduledExecutorService timers;
     private final ExecutorService jobs;
@@ -161,21 +199,125 @@ public final class CoordinatorNode implements AutoCloseable {
         lastHeartbeatNanos = System.nanoTime()
                 + ThreadLocalRandom.current().nextLong(ELECTION_TIMEOUT_JITTER_MILLIS);
         timers.scheduleWithFixedDelay(this::tick, 25, 25, TimeUnit.MILLISECONDS);
-        System.out.printf("[Coordinator %d] serving worker+coordinator at %s:%d (term=%d)%n",
-                workerId, host, port, getCurrentTerm());
+        startMembershipWatcher();
+        System.out.printf("[Coordinator %d] started at %s:%d JAC=%d term=%d neighbours=%s%n",
+                workerId, host, port, jac.get(), getCurrentTerm(), neighborIdsString());
+    }
+
+    /**
+     * Watches Bootstrap membership and prunes neighbour links whose workers
+     * left or expired (§7.1), so floods stop dialling dead peers. Runs as a
+     * daemon; failures here never disturb the timer or job pools.
+     */
+    private void startMembershipWatcher() {
+        Thread watcher = new Thread(() -> {
+            long version = membershipWatcherVersion.get();
+            try {
+                version = membership.snapshot().version();
+                membershipWatcherVersion.set(version);
+            } catch (RuntimeException e) {
+                version = -1;
+            }
+            while (!closed.get()) {
+                try {
+                    long next = membership.awaitChange(version,
+                            Duration.ofSeconds(5));
+                    version = next;
+                    membershipWatcherVersion.set(next);
+                    pruneNeighborsToActive();
+                } catch (InterruptedException e) {
+                    Thread.currentThread().interrupt();
+                    return;
+                } catch (RuntimeException e) {
+                    try {
+                        Thread.sleep(1_000);
+                    } catch (InterruptedException ie) {
+                        Thread.currentThread().interrupt();
+                        return;
+                    }
+                }
+            }
+        }, "coordinator-" + workerId + "-membership-watch");
+        watcher.setDaemon(true);
+        membershipWatcher = watcher;
+        watcher.start();
+    }
+
+    /** Drops neighbour links absent from the active Bootstrap snapshot. */
+    void pruneNeighborsToActive() {
+        java.util.Set<Integer> active;
+        try {
+            active = new java.util.HashSet<>();
+            for (WorkerEndpoint w : membership.snapshot().workers()) {
+                active.add(w.getWorkerId());
+            }
+        } catch (RuntimeException e) {
+            return;
+        }
+        for (WorkerEndpoint n : neighbors) {
+            if (!active.contains(n.getWorkerId())) {
+                removeNeighborEndpoint(n.getWorkerId());
+                System.out.printf("[Coordinator %d] neighbours: pruned departed worker %d"
+                                + " — neighbours now %s%n",
+                        workerId, n.getWorkerId(), neighborIdsString());
+            }
+        }
+    }
+
+    /** Removes one neighbour link. Returns true if one was present. */
+    public boolean removeNeighborEndpoint(int neighbourId) {
+        boolean removed = neighbors.removeIf(n -> n.getWorkerId() == neighbourId);
+        neighborFailures.remove(neighbourId);
+        return removed;
+    }
+
+    private void recordNeighborSuccess(int neighbourId) {
+        neighborFailures.remove(neighbourId);
+    }
+
+    /**
+     * Counts a failed RPC to a neighbour and drops the link after
+     * {@link #MAX_NEIGHBOR_FAILURES} consecutive failures (§7.1).
+     */
+    private void recordNeighborFailure(int neighbourId) {
+        AtomicInteger count = neighborFailures.computeIfAbsent(neighbourId,
+                k -> new AtomicInteger(0));
+        if (count.incrementAndGet() >= MAX_NEIGHBOR_FAILURES) {
+            if (removeNeighborEndpoint(neighbourId)) {
+                System.out.printf("[Coordinator %d] neighbours: dropped unreachable worker %d"
+                                + " after %d consecutive failures — neighbours now %s%n",
+                        workerId, neighbourId, MAX_NEIGHBOR_FAILURES, neighborIdsString());
+            }
+        }
     }
 
     // ---- Client entry points ----
 
     /**
-     * Submits a job. Leaders execute; followers forward once to the known
-     * leader over gRPC and otherwise fail with the leader hint.
+     * Submits a job. Leaders execute; followers forward to the known leader
+     * over gRPC. When no live coordinator exists, a JAC flood election is
+     * initiated first (any worker may initiate), then forwarding is retried
+     * once before failing with the leader hint.
      */
     public long submitJob(JobRequest request) throws JobExecutionException {
         if (request == null) throw new IllegalArgumentException("request must not be null");
         if (closed.get()) throw new JobExecutionException("coordinator node is closed");
         if (isLeader()) {
             return executeNewJob(request);
+        }
+        if (!hasLiveLeader()) {
+            System.out.printf("[Coordinator %d] no live coordinator — worker %d initiating"
+                            + " on-demand election for job %s%n",
+                    workerId, workerId, request.jobId());
+            try {
+                initiateElection();
+            } catch (RuntimeException e) {
+                System.err.printf("[Coordinator %d] on-demand election failed: %s%n",
+                        workerId, e.getMessage());
+            }
+            if (isLeader()) {
+                return executeNewJob(request);
+            }
         }
         LeaderHint hint = leaderHint();
         if (hint != null && hint.workerId() != workerId) {
@@ -194,12 +336,39 @@ public final class CoordinatorNode implements AutoCloseable {
                     return response.getResultValue();
                 }
             } catch (StatusRuntimeException e) {
-                // Leader hint is stale; fall through to the hinted failure below.
+                // Leader hint is stale: try one election, then one retry.
+                try {
+                    initiateElection();
+                } catch (RuntimeException ignored) {
+                    // Fall through to the hinted failure below.
+                }
+                LeaderHint fresh = leaderHint();
+                if (fresh != null && fresh.workerId() != workerId
+                        && fresh.host() != null && fresh.port() > 0) {
+                    try {
+                        CoordinatorJobResponse retry = coordClient.submit(
+                                fresh.host(), fresh.port(),
+                                CoordinatorJobRequest.newBuilder()
+                                        .setJob(CoordinatorJobMapper.toSpec(request)).build(),
+                                config.taskTimeout().toMillis() + config.jobTimeout().toMillis());
+                        if (retry.getExecuted()) {
+                            if (!retry.getError().isEmpty()) {
+                                throw new JobExecutionException("job " + request.jobId()
+                                        + " failed on leader " + fresh.workerId() + ": "
+                                        + retry.getError());
+                            }
+                            return retry.getResultValue();
+                        }
+                    } catch (StatusRuntimeException ignored) {
+                        // Fall through to the hinted failure below.
+                    }
+                }
             }
         }
+        LeaderHint hintNow = leaderHint();
         throw new NotLeaderException("worker " + workerId + " is not the leader",
-                leaderId(), hint == null ? null : hint.host(),
-                hint == null ? -1 : hint.port());
+                leaderId(), hintNow == null ? null : hintNow.host(),
+                hintNow == null ? -1 : hintNow.port());
     }
 
     // ---- gRPC handlers (delegated from CoordinatorServiceImpl) ----
@@ -235,20 +404,30 @@ public final class CoordinatorNode implements AutoCloseable {
         }
     }
 
+    /** Backwards-compatible heartbeat (unknown leader JAC). */
     HeartbeatOutcome handleHeartbeat(long term, int heartbeatLeaderId,
                                      String leaderHost, int leaderPort,
                                      long commitProgress) {
+        return handleHeartbeat(term, heartbeatLeaderId, leaderHost, leaderPort,
+                commitProgress, Integer.MAX_VALUE);
+    }
+
+    HeartbeatOutcome handleHeartbeat(long term, int heartbeatLeaderId,
+                                     String leaderHost, int leaderPort,
+                                     long commitProgress, int heartbeatLeaderJac) {
         synchronized (stateLock) {
             if (term < currentTerm) return new HeartbeatOutcome(currentTerm, false);
             if (term > currentTerm) {
                 stepDownLocked(term);
                 leaderId = heartbeatLeaderId;
+                leaderJac = heartbeatLeaderJac;
                 lastHeartbeatNanos = System.nanoTime();
                 store.observeProgress(commitProgress);
                 return new HeartbeatOutcome(currentTerm, true);
             }
             if (leaderId == null) {
                 leaderId = heartbeatLeaderId;
+                leaderJac = heartbeatLeaderJac;
                 lastHeartbeatNanos = System.nanoTime();
                 store.observeProgress(commitProgress);
                 return new HeartbeatOutcome(currentTerm, true);
@@ -260,6 +439,7 @@ public final class CoordinatorNode implements AutoCloseable {
                         workerId, heartbeatLeaderId, currentTerm, leaderId);
                 return new HeartbeatOutcome(currentTerm, false);
             }
+            leaderJac = heartbeatLeaderJac;
             lastHeartbeatNanos = System.nanoTime();
             store.observeProgress(commitProgress);
             return new HeartbeatOutcome(currentTerm, true);
@@ -325,16 +505,40 @@ public final class CoordinatorNode implements AutoCloseable {
     }
 
     GetCoordinatorStateResponse handleGetState() {
+        int jacNow = jac.get();
+        int termCountNow = jobsInCurrentTerm.get();
+        int leaderJacNow;
+        List<Integer> neighbourIds = new ArrayList<>();
+        for (WorkerEndpoint n : neighbors) {
+            neighbourIds.add(n.getWorkerId());
+        }
+        neighbourIds.sort(Integer::compareTo);
         GetCoordinatorStateResponse.Builder response = GetCoordinatorStateResponse.newBuilder()
                 .setCurrentTerm(getCurrentTerm())
                 .setLeaderId(leaderId() == null ? -1 : leaderId())
                 .setIsLeader(isLeader())
                 .setCommitProgressIndex(store.progress())
-                .setWorkerId(workerId);
+                .setWorkerId(workerId)
+                .setJac(jacNow)
+                .setJobsInCurrentTerm(termCountNow);
+        synchronized (stateLock) {
+            leaderJacNow = leaderJac;
+        }
+        response.setLeaderJac(leaderJacNow);
+        for (int id : neighbourIds) {
+            response.addNeighborIds(id);
+        }
         for (ReplicatedJobStore.JobRecord job : store.snapshots()) {
             response.addJobs(CoordinatorJobMapper.toJobProto(job));
         }
         return response.build();
+    }
+
+    /** Suggested §5 Ping: liveness probe for peers and operators. */
+    com.cs324a2.grpc.coordinator.PingResponse handlePing(int callerId) {
+        return com.cs324a2.grpc.coordinator.PingResponse.newBuilder()
+                .setWorkerId(workerId).setIsLeader(isLeader())
+                .setTerm(getCurrentTerm()).build();
     }
 
     /**
@@ -469,18 +673,28 @@ public final class CoordinatorNode implements AutoCloseable {
                 }
             } else if (System.nanoTime() - lastHeartbeatNanos
                     >= TimeUnit.MILLISECONDS.toNanos(electionTimeoutMillis)) {
-                startElection();
+                // Primary path: unstructured JAC flood election over gRPC.
+                long silentMs = TimeUnit.NANOSECONDS.toMillis(
+                        System.nanoTime() - lastHeartbeatNanos);
+                System.out.printf("[Coordinator %d] no heartbeat from leader %s for %dms"
+                                + " (timeout %dms) — starting election%n",
+                        workerId, leaderId(), silentMs, electionTimeoutMillis);
+                initiateElectionAsync();
             }
         } catch (Throwable e) {
             System.err.printf("[Coordinator %d] timer tick failed: %s%n", workerId, e);
         }
     }
 
-    void startElection() {
+    /** Async wrapper so the timer thread never blocks on flood RPCs. */
+    void initiateElectionAsync() {
         if (closed.get() || !electionInProgress.compareAndSet(false, true)) return;
         jobs.execute(() -> {
             try {
-                runElection();
+                initiateElection();
+            } catch (RuntimeException e) {
+                System.err.printf("[Coordinator %d] background election failed: %s%n",
+                        workerId, e.getMessage());
             } finally {
                 electionInProgress.set(false);
             }
@@ -555,6 +769,7 @@ public final class CoordinatorNode implements AutoCloseable {
             peers = membership.snapshot().workers();
         }
         lastHeartbeatSentNanos = System.nanoTime();
+        int jacNow = jac.get();
         for (WorkerEndpoint peer : peers) {
             if (peer.getWorkerId() == workerId) continue;
             try {
@@ -562,8 +777,10 @@ public final class CoordinatorNode implements AutoCloseable {
                         com.cs324a2.grpc.coordinator.LeaderHeartbeatRequest.newBuilder()
                                 .setTerm(term).setLeaderId(workerId)
                                 .setLeaderHost(host).setLeaderPort(port)
-                                .setCommitProgressIndex(store.progress()).build(),
+                                .setCommitProgressIndex(store.progress())
+                                .setLeaderJac(jacNow).build(),
                         RPC_TIMEOUT_MILLIS);
+                recordNeighborSuccess(peer.getWorkerId());
                 if (response.getTerm() > term) {
                     synchronized (stateLock) {
                         stepDownLocked(response.getTerm());
@@ -579,7 +796,416 @@ public final class CoordinatorNode implements AutoCloseable {
                 }
             } catch (RuntimeException e) {
                 // A departed follower misses this round; expiry is membership-driven.
+                recordNeighborFailure(peer.getWorkerId());
             }
+        }
+    }
+
+    // ---- Unstructured JAC election (ELECTION/COORDINATOR flood over gRPC) ----
+
+    /** Best-candidate comparison: lowest JAC wins; ties break to highest ID. */
+    static boolean isBetterCandidate(int idA, int jacA, int idB, int jacB) {
+        if (jacA != jacB) return jacA < jacB;
+        return idA > idB;
+    }
+
+    public int getJAC() {
+        return jac.get();
+    }
+
+    public void setJAC(int value) {
+        jac.set(value);
+    }
+
+    public int getJobsInCurrentTerm() {
+        return jobsInCurrentTerm.get();
+    }
+
+    public List<WorkerEndpoint> getNeighbors() {
+        return List.copyOf(neighbors);
+    }
+
+    /** Adds a neighbour link; ignores self and duplicates. Returns true if added. */
+    public boolean addNeighborEndpoint(WorkerEndpoint endpoint) {
+        if (endpoint == null || endpoint.getWorkerId() == workerId) return false;
+        for (WorkerEndpoint existing : neighbors) {
+            if (existing.getWorkerId() == endpoint.getWorkerId()) return false;
+        }
+        neighbors.add(endpoint);
+        System.out.printf("[Coordinator %d] neighbours: worker %d linked to worker %d"
+                        + " at %s:%d — neighbours now %s%n",
+                workerId, workerId, endpoint.getWorkerId(),
+                endpoint.getHost(), endpoint.getPort(), neighborIdsString());
+        return true;
+    }
+
+    /** Sorted neighbour ID list for terminal output. */
+    private String neighborIdsString() {
+        List<Integer> ids = new ArrayList<>();
+        for (WorkerEndpoint n : neighbors) {
+            ids.add(n.getWorkerId());
+        }
+        ids.sort(Integer::compareTo);
+        return ids.toString();
+    }
+
+    public boolean handleAddNeighbor(int neighbourId, String neighbourHost, int neighbourPort) {
+        if (neighbourId <= 0 || neighbourHost == null || neighbourHost.isBlank()
+                || neighbourPort < 1 || neighbourPort > 65535
+                || neighbourId == workerId) {
+            return false;
+        }
+        return addNeighborEndpoint(WorkerEndpoint.newBuilder()
+                .setWorkerId(neighbourId).setHost(neighbourHost).setPort(neighbourPort)
+                .setRegistrationId("neighbour-" + neighbourId).build());
+    }
+
+    /**
+     * Connects to one random active worker from Bootstrap and forms a bilateral
+     * neighbour link via gRPC. No-op when alone or already meshed.
+     */
+    public void connectToRandomNeighbor() {
+        List<WorkerEndpoint> actives;
+        try {
+            actives = membership.snapshot().workers().stream()
+                    .filter(w -> w.getWorkerId() != workerId).toList();
+        } catch (RuntimeException e) {
+            return;
+        }
+        if (actives.isEmpty()) return;
+        List<WorkerEndpoint> unknown = actives.stream()
+                .filter(w -> neighbors.stream()
+                        .noneMatch(n -> n.getWorkerId() == w.getWorkerId()))
+                .toList();
+        if (unknown.isEmpty()) return;
+        WorkerEndpoint peer = unknown.get(
+                ThreadLocalRandom.current().nextInt(unknown.size()));
+        System.out.printf("[Coordinator %d] joining: randomly chosen active worker is %d"
+                        + " at %s:%d — requesting bilateral neighbour link%n",
+                workerId, peer.getWorkerId(), peer.getHost(), peer.getPort());
+        addNeighborEndpoint(peer);
+        try {
+            var response = coordClient.addNeighbor(peer.getHost(), peer.getPort(),
+                    com.cs324a2.grpc.coordinator.NeighborRequest.newBuilder()
+                            .setWorkerId(workerId).setHost(host).setPort(port).build(),
+                    RPC_TIMEOUT_MILLIS);
+            System.out.printf("[Coordinator %d] neighbour link with worker %d %s"
+                            + " — neighbours now %s%n",
+                    workerId, peer.getWorkerId(),
+                    response.getAdded() ? "confirmed bilateral" : "already existed",
+                    neighborIdsString());
+        } catch (RuntimeException e) {
+            System.err.printf("[Coordinator %d] random link to %d failed: %s%n",
+                    workerId, peer.getWorkerId(), e.getMessage());
+        }
+    }
+
+    /** Resolves flood peers: neighbours when linked, else full membership. */
+    private List<WorkerEndpoint> floodPeersExcluding(int senderId) {
+        List<WorkerEndpoint> base = neighbors.isEmpty()
+                ? membership.snapshot().workers()
+                : List.copyOf(neighbors);
+        return base.stream().filter(w -> w.getWorkerId() != workerId
+                && w.getWorkerId() != senderId).toList();
+    }
+
+    private boolean hasLiveLeader() {
+        Integer id;
+        synchronized (stateLock) {
+            id = leaderId;
+            if (isLeader) return true;
+            if (id == null) return false;
+        }
+        long sinceHeartbeat = System.nanoTime() - lastHeartbeatNanos;
+        return sinceHeartbeat < TimeUnit.MILLISECONDS.toNanos(electionTimeoutMillis);
+    }
+
+    /**
+     * ELECTION convergecast handler. Duplicate election_ids are ignored
+     * (duplicate=true) so each worker processes a given ELECTION once; the
+     * caller ignores those subtrees. Otherwise floods to neighbours except the
+     * sender and returns the best reachable candidate.
+     */
+    public com.cs324a2.grpc.coordinator.ElectionResponse handlePropagateElection(
+            com.cs324a2.grpc.coordinator.ElectionRequest request) {
+        String electionId = request.getElectionId();
+        if (!seenElectionIds.add(electionId)) {
+            return com.cs324a2.grpc.coordinator.ElectionResponse.newBuilder()
+                    .setDuplicate(true).setTerm(getCurrentTerm()).build();
+        }
+        System.out.printf("[Coordinator %d] ELECTION %s from %d JAC=%d%n",
+                workerId, electionId, request.getSenderId(), jac.get());
+        int bestId = workerId;
+        int bestJac = jac.get();
+        String bestHost = host;
+        int bestPort = port;
+        for (WorkerEndpoint peer : floodPeersExcluding(request.getSenderId())) {
+            try {
+                var child = coordClient.propagateElection(peer.getHost(), peer.getPort(),
+                        com.cs324a2.grpc.coordinator.ElectionRequest.newBuilder()
+                                .setElectionId(electionId).setSenderId(workerId)
+                                .setSenderHost(host).setSenderPort(port).build(),
+                        RPC_TIMEOUT_MILLIS + 1_200);
+                recordNeighborSuccess(peer.getWorkerId());
+                if (child.getDuplicate()) continue;
+                if (isBetterCandidate(child.getBestWorkerId(), child.getBestJac(),
+                        bestId, bestJac)) {
+                    bestId = child.getBestWorkerId();
+                    bestJac = child.getBestJac();
+                    bestHost = child.getBestHost();
+                    bestPort = child.getBestPort();
+                }
+            } catch (RuntimeException e) {
+                System.err.printf("[Coordinator %d] ELECTION %s child %d failed: %s%n",
+                        workerId, electionId, peer.getWorkerId(), e.getMessage());
+                recordNeighborFailure(peer.getWorkerId());
+            }
+        }
+        System.out.printf("[Coordinator %d] subtree best for %s = id=%d JAC=%d%n",
+                workerId, electionId, bestId, bestJac);
+        return com.cs324a2.grpc.coordinator.ElectionResponse.newBuilder()
+                .setDuplicate(false).setBestWorkerId(bestId).setBestJac(bestJac)
+                .setBestHost(bestHost).setBestPort(bestPort)
+                .setTerm(getCurrentTerm()).build();
+    }
+
+    /**
+     * COORDINATOR flood handler. Duplicate message_ids are ignored; otherwise
+     * installs the announced leader (agreement) and forwards to neighbours
+     * except the sender so all reachable workers learn the result. Stale terms
+     * are rejected; same-term conflicts resolve deterministically to the
+     * better JAC candidate so concurrent elections still converge.
+     */
+    public com.cs324a2.grpc.coordinator.CoordinatorAck handlePropagateCoordinator(
+            com.cs324a2.grpc.coordinator.CoordinatorAnnounce request) {
+        if (!seenCoordinatorIds.add(request.getCoordinatorMessageId())) {
+            return com.cs324a2.grpc.coordinator.CoordinatorAck.newBuilder()
+                    .setAccepted(false).setTerm(getCurrentTerm()).build();
+        }
+        long seenTerm = getCurrentTerm();
+        if (request.getTerm() < seenTerm) {
+            return com.cs324a2.grpc.coordinator.CoordinatorAck.newBuilder()
+                    .setAccepted(false).setTerm(seenTerm).build();
+        }
+        synchronized (stateLock) {
+            if (request.getTerm() == currentTerm && leaderId != null
+                    && !leaderId.equals(request.getCoordinatorId())
+                    && !isBetterCandidate(request.getCoordinatorId(),
+                            request.getCoordinatorJac(), leaderId, leaderJac)) {
+                // Keep the better same-term leader, but still forward the
+                // announcement so the flood reaches the whole overlay.
+                System.out.printf("[Coordinator %d] COORDINATOR %s keeps %d over %d (same term %d)%n",
+                        workerId, request.getCoordinatorMessageId(),
+                        leaderId, request.getCoordinatorId(), currentTerm);
+            } else {
+                System.out.printf("[Coordinator %d] COORDINATOR %s: worker %d announced as"
+                                + " coordinator (JAC=%d) for term %d, forwarded by worker %d%n",
+                        workerId, request.getCoordinatorMessageId(),
+                        request.getCoordinatorId(), request.getCoordinatorJac(),
+                        request.getTerm(), request.getSenderId());
+                installCoordinatorStateLocked(request.getCoordinatorId(),
+                        request.getCoordinatorHost(), request.getCoordinatorPort(),
+                        request.getTerm(), request.getCoordinatorJac());
+                if (request.getCoordinatorId() != workerId) {
+                    System.out.printf("[Coordinator %d] recognizes worker %d as coordinator"
+                                    + " for term %d (this node is a follower)%n",
+                            workerId, request.getCoordinatorId(), request.getTerm());
+                }
+            }
+        }
+        for (WorkerEndpoint peer : floodPeersExcluding(request.getSenderId())) {
+            try {
+                coordClient.propagateCoordinator(peer.getHost(), peer.getPort(),
+                        com.cs324a2.grpc.coordinator.CoordinatorAnnounce.newBuilder(
+                                request).setSenderId(workerId)
+                                .setSenderHost(host).setSenderPort(port).build(),
+                        RPC_TIMEOUT_MILLIS);
+                recordNeighborSuccess(peer.getWorkerId());
+            } catch (RuntimeException e) {
+                System.err.printf("[Coordinator %d] COORDINATOR forward to %d failed: %s%n",
+                        workerId, peer.getWorkerId(), e.getMessage());
+                recordNeighborFailure(peer.getWorkerId());
+            }
+        }
+        return com.cs324a2.grpc.coordinator.CoordinatorAck.newBuilder()
+                .setAccepted(true).setTerm(getCurrentTerm()).build();
+    }
+
+    private void installCoordinatorState(int electedId, String electedHost,
+                                         int electedPort, long term) {
+        installCoordinatorStateUnsync(electedId, electedHost, electedPort, term,
+                Integer.MAX_VALUE);
+    }
+
+    private void installCoordinatorState(int electedId, String electedHost,
+                                         int electedPort, long term, int electedJac) {
+        installCoordinatorStateUnsync(electedId, electedHost, electedPort,
+                term, electedJac);
+    }
+
+    /** Caller must hold {@code stateLock} when calling the locked variant. */
+    private void installCoordinatorStateLocked(int electedId, String electedHost,
+                                               int electedPort, long term, int electedJac) {
+        boolean was = isLeader;
+        if (term > currentTerm) {
+            currentTerm = term;
+            votedFor = null;
+        }
+        leaderId = electedId;
+        leaderJac = electedJac;
+        isLeader = (electedId == workerId);
+        lastHeartbeatNanos = System.nanoTime();
+        boolean became = isLeader && !was;
+        synchronized (termStateLock) {
+            inFlightJobs = 0;
+            termClosing = false;
+            termTransitionStarted = false;
+            if (isLeader) jobsInCurrentTerm.set(0);
+        }
+        WorkerEndpoint elected = WorkerEndpoint.newBuilder().setWorkerId(electedId)
+                .setHost(electedHost == null || electedHost.isBlank() ? "localhost" : electedHost)
+                .setPort(electedPort > 0 ? electedPort : port)
+                .setRegistrationId("elected-" + electedId).build();
+        boolean becameCopy = became;
+        boolean leaderCopy = isLeader;
+        if (electedId != workerId) addNeighborEndpoint(elected);
+        // RPCs outside the state lock.
+        if (becameCopy || leaderCopy) {
+            lastHeartbeatSentNanos = 0;
+        }
+        if (becameCopy) {
+            System.out.printf("[Coordinator %d] *** worker %d BECAME COORDINATOR *** term=%d"
+                            + " JAC=%d (announcing to all reachable workers)%n",
+                    workerId, workerId, currentTerm, jac.get());
+        }
+        if (becameCopy || leaderCopy) {
+            // Release stateLock before network I/O: copy what we need.
+            // (Called with stateLock held; use a detached task to avoid nesting.)
+            try {
+                jobs.execute(() -> {
+                    try {
+                        broadcastHeartbeats();
+                    } catch (RuntimeException ignored) {
+                        // Best effort; the timer repeats heartbeats.
+                    }
+                    if (becameCopy) {
+                        try {
+                            recoverUnfinishedJobs();
+                        } catch (RuntimeException ignored) {
+                            // Best effort recovery; jobs retry on demand.
+                        }
+                    }
+                });
+            } catch (RuntimeException ignored) {
+                // Executor shutting down; heartbeats resume on next tick.
+            }
+        }
+    }
+
+    private void installCoordinatorStateUnsync(int electedId, String electedHost,
+                                               int electedPort, long term, int electedJac) {
+        synchronized (stateLock) {
+            installCoordinatorStateLocked(electedId, electedHost, electedPort,
+                    term, electedJac);
+        }
+    }
+
+    /**
+     * Initiates a JAC flood election when no live coordinator holds the term.
+     * Any worker may call this; floods ELECTION, picks lowest-JAC (ties to
+     * highest ID), installs locally, then floods COORDINATOR.
+     */
+    public void initiateElection() {
+        synchronized (electionLock) {
+            if (hasLiveLeader()) {
+                System.out.printf("[Coordinator %d] election aborted: leader %s still active%n",
+                        workerId, leaderId());
+                return;
+            }
+            // A dead hint must not block the new term.
+            synchronized (stateLock) {
+                if (leaderId != null) {
+                    long sinceHeartbeat = System.nanoTime() - lastHeartbeatNanos;
+                    if (sinceHeartbeat >= TimeUnit.MILLISECONDS.toNanos(electionTimeoutMillis)) {
+                        leaderId = null;
+                        leaderJac = Integer.MAX_VALUE;
+                        isLeader = false;
+                    }
+                }
+            }
+            long term;
+            synchronized (stateLock) {
+                currentTerm++;
+                term = currentTerm;
+            }
+            electionCount.incrementAndGet();
+            String electionId = "ELECTION-" + workerId + "-" + electionSeq.incrementAndGet();
+            System.out.printf("%n[Coordinator %d] ========== worker %d INITIATED ELECTION %s"
+                            + " for term %d (own JAC=%d, flooding %d peer(s)) ==========%n",
+                    workerId, workerId, electionId, term, jac.get(),
+                    floodPeersExcluding(-1).size());
+            seenElectionIds.add(electionId);
+
+            int bestId = workerId;
+            int bestJac = jac.get();
+            String bestHost = host;
+            int bestPort = port;
+            for (WorkerEndpoint peer : floodPeersExcluding(-1)) {
+                try {
+                    var child = coordClient.propagateElection(peer.getHost(), peer.getPort(),
+                            com.cs324a2.grpc.coordinator.ElectionRequest.newBuilder()
+                                    .setElectionId(electionId).setSenderId(workerId)
+                                    .setSenderHost(host).setSenderPort(port).build(),
+                            RPC_TIMEOUT_MILLIS + 1_200);
+                    recordNeighborSuccess(peer.getWorkerId());
+                    if (child.getDuplicate()) continue;
+                    if (isBetterCandidate(child.getBestWorkerId(), child.getBestJac(),
+                            bestId, bestJac)) {
+                        bestId = child.getBestWorkerId();
+                        bestJac = child.getBestJac();
+                        bestHost = child.getBestHost();
+                        bestPort = child.getBestPort();
+                    }
+                    if (child.getTerm() > term) {
+                        synchronized (stateLock) {
+                            if (child.getTerm() > currentTerm) {
+                                stepDownLocked(child.getTerm());
+                            }
+                        }
+                        term = getCurrentTerm();
+                    }
+                } catch (RuntimeException e) {
+                    System.err.printf("[Coordinator %d] election child %d failed: %s%n",
+                            workerId, peer.getWorkerId(), e.getMessage());
+                    recordNeighborFailure(peer.getWorkerId());
+                }
+            }
+            System.out.printf("[Coordinator %d] ELECTION %s complete: elected worker %d"
+                            + " as coordinator (JAC=%d) for term %d — flooding COORDINATOR%n",
+                    workerId, electionId, bestId, bestJac, term);
+            installCoordinatorState(bestId, bestHost, bestPort, term, bestJac);
+
+            String coordMsgId = "COORDINATOR-" + electionId;
+            seenCoordinatorIds.add(coordMsgId);
+            var announce = com.cs324a2.grpc.coordinator.CoordinatorAnnounce.newBuilder()
+                    .setCoordinatorMessageId(coordMsgId).setCoordinatorId(bestId)
+                    .setCoordinatorHost(bestHost).setCoordinatorPort(bestPort)
+                    .setCoordinatorJac(bestJac).setTerm(term)
+                    .setSenderId(workerId).setSenderHost(host).setSenderPort(port).build();
+            for (WorkerEndpoint peer : floodPeersExcluding(-1)) {
+                try {
+                    coordClient.propagateCoordinator(peer.getHost(), peer.getPort(),
+                            announce, RPC_TIMEOUT_MILLIS);
+                    recordNeighborSuccess(peer.getWorkerId());
+                } catch (RuntimeException e) {
+                    System.err.printf("[Coordinator %d] coordinator broadcast to %d failed: %s%n",
+                            workerId, peer.getWorkerId(), e.getMessage());
+                    recordNeighborFailure(peer.getWorkerId());
+                }
+            }
+            System.out.printf("[Coordinator %d] ========== ELECTION %s COMPLETE: coordinator=%d"
+                            + " term=%d ==========%n%n",
+                    workerId, electionId, bestId, term);
         }
     }
 
@@ -598,24 +1224,84 @@ public final class CoordinatorNode implements AutoCloseable {
             }
             return resumeJob(request.jobId());
         }
-        confirmLeadership();
-        long term = getCurrentTerm();
-        List<WorkerEndpoint> members = membership.snapshot().workers();
-        int partitions = partitionCountFor(request, members.size());
-        List<WorkUnit> units = WorkPartitioner.partition(request, partitions);
-        ReplicatedJobStore.JobRecord admitted;
-        if (units.isEmpty()) {
-            admitted = store.createEmptyJob(request, term, 0L);
-            System.out.printf("[Coordinator %d] event=ADMIT progress=%d jobId=%s term=%d (empty)%n",
-                    workerId, admitted.progressIndex(), request.jobId(), term);
+        // One-term / five-job admission: increments JAC + term count.
+        JobAdmission admission = admitTopLevelJob();
+        try {
+            confirmLeadership();
+            long term = getCurrentTerm();
+            List<WorkerEndpoint> members = membership.snapshot().workers();
+            int partitions = partitionCountFor(request, members.size());
+            List<WorkUnit> units = WorkPartitioner.partition(request, partitions);
+            ReplicatedJobStore.JobRecord admitted;
+            if (units.isEmpty()) {
+                admitted = store.createEmptyJob(request, term, 0L);
+                System.out.printf("[Coordinator %d] event=ADMIT progress=%d jobId=%s term=%d (empty) JAC=%d termCount=%d/%d%n",
+                        workerId, admitted.progressIndex(), request.jobId(), term,
+                        admission.jac(), admission.termCount(), MAX_JOBS_PER_TERM);
+                replicate(admitted.snapshot());
+                return 0L;
+            }
+            admitted = store.createJob(request, units, term);
+            System.out.printf("[Coordinator %d] event=ADMIT progress=%d jobId=%s term=%d tasks=%d JAC=%d termCount=%d/%d%n",
+                    workerId, admitted.progressIndex(), request.jobId(), term, units.size(),
+                    admission.jac(), admission.termCount(), MAX_JOBS_PER_TERM);
             replicate(admitted.snapshot());
-            return 0L;
+            return runDispatchLoop(request.jobId());
+        } finally {
+            completeTopLevelJob(admission);
         }
-        admitted = store.createJob(request, units, term);
-        System.out.printf("[Coordinator %d] event=ADMIT progress=%d jobId=%s term=%d tasks=%d%n",
-                workerId, admitted.progressIndex(), request.jobId(), term, units.size());
-        replicate(admitted.snapshot());
-        return runDispatchLoop(request.jobId());
+    }
+
+    /** Admission record for the five-jobs-per-term rule. */
+    private record JobAdmission(long termSequence, int jac, int termCount) {
+    }
+
+    private JobAdmission admitTopLevelJob() throws JobExecutionException {
+        synchronized (stateLock) {
+            if (!isLeader) {
+                throw new NotLeaderException("not the leader",
+                        leaderId, null, -1);
+            }
+            synchronized (termStateLock) {
+                if (termClosing || jobsInCurrentTerm.get() >= MAX_JOBS_PER_TERM) {
+                    throw new JobExecutionException("Coordinator term is transitioning;"
+                            + " try the new coordinator");
+                }
+                int newJac = jac.incrementAndGet();
+                int termCount = jobsInCurrentTerm.incrementAndGet();
+                inFlightJobs++;
+                if (termCount >= MAX_JOBS_PER_TERM) {
+                    termClosing = true;
+                }
+                return new JobAdmission(currentTerm, newJac, termCount);
+            }
+        }
+    }
+
+    private void completeTopLevelJob(JobAdmission admission) {
+        boolean startReelection = false;
+        synchronized (stateLock) {
+            synchronized (termStateLock) {
+                if (admission == null) return;
+                if (inFlightJobs > 0) inFlightJobs--;
+                // Finish-then-step-down: only when every admitted job finished.
+                if (inFlightJobs == 0 && termClosing
+                        && !termTransitionStarted && isLeader) {
+                    termTransitionStarted = true;
+                    isLeader = false;
+                    leaderId = null;
+                    leaderJac = Integer.MAX_VALUE;
+                    jobsInCurrentTerm.set(0);
+                    startReelection = true;
+                }
+            }
+        }
+        if (startReelection) {
+            System.out.printf("[Coordinator %d] term closed after %d admissions;"
+                            + " in-flight drained, initiating new election%n",
+                    workerId, MAX_JOBS_PER_TERM);
+            initiateElectionAsync();
+        }
     }
 
     /**
@@ -1083,6 +1769,7 @@ public final class CoordinatorNode implements AutoCloseable {
         }
         int quorum = quorumOf(peers);
         int acks = 1; // self
+        int jacNow = jac.get();
         for (WorkerEndpoint peer : peers) {
             if (peer.getWorkerId() == workerId) continue;
             try {
@@ -1090,7 +1777,8 @@ public final class CoordinatorNode implements AutoCloseable {
                         com.cs324a2.grpc.coordinator.LeaderHeartbeatRequest
                                 .newBuilder().setTerm(term).setLeaderId(workerId)
                                 .setLeaderHost(host).setLeaderPort(port)
-                                .setCommitProgressIndex(store.progress()).build(),
+                                .setCommitProgressIndex(store.progress())
+                                .setLeaderJac(jacNow).build(),
                         RPC_TIMEOUT_MILLIS);
                 if (response.getTerm() > term) {
                     synchronized (stateLock) {
@@ -1122,6 +1810,7 @@ public final class CoordinatorNode implements AutoCloseable {
         currentTerm = newTerm;
         votedFor = null;
         leaderId = null;
+        leaderJac = Integer.MAX_VALUE;
         isLeader = false;
         lastHeartbeatNanos = System.nanoTime();
     }
@@ -1183,6 +1872,8 @@ public final class CoordinatorNode implements AutoCloseable {
     @Override
     public void close() {
         if (!closed.compareAndSet(false, true)) return;
+        Thread watcher = membershipWatcher;
+        if (watcher != null) watcher.interrupt();
         timers.shutdownNow();
         jobs.shutdownNow();
         try {

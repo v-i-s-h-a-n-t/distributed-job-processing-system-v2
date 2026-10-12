@@ -9,11 +9,15 @@ import com.cs324a2.scheduler.SchedulerConfig;
  * Production entry point for a combined worker + coordinator node.
  *
  * <p>Each process serves task execution and the gRPC {@code CoordinatorService}
- * (leader terms, voting, leader heartbeats, replicated job checkpoints) on one
+ * (JAC flood election, leader heartbeats, replicated job checkpoints) on one
  * port, registers with Bootstrap for membership/quorum, and dispatches tasks
  * to peers over gRPC. Kill any process (including the leader) mid-job: the
  * survivors elect a replacement, restore the replicated state, resume
  * unfinished tasks, and keep accepting later jobs.
+ *
+ * <p>Note: this is the election-capable worker. The task-only
+ * {@code com.cs324a2.worker.WorkerServer} executes jobs but never stands for
+ * election (no JAC, no CoordinatorService).
  *
  * <p>Usage: {@code CoordinatorServer <workerId> <advertisedHost> <workerPort>
  * <bootstrapHost> <bootstrapPort>}
@@ -44,6 +48,13 @@ public final class CoordinatorServer {
         heartbeat.start();
         membership.start();
         node.start();
+        // Unstructured overlay: link to one random active worker (bilateral).
+        try {
+            node.connectToRandomNeighbor();
+        } catch (RuntimeException e) {
+            System.err.printf("Coordinator node %d random link failed: %s%n",
+                    workerId, e.getMessage());
+        }
         System.out.printf("Coordinator node %d ready at %s:%d; election runs automatically.%n",
                 workerId, advertisedHost, workerPort);
 
