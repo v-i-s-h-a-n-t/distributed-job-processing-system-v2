@@ -51,7 +51,7 @@ public final class GrpcClientService implements AutoCloseable {
         }
     }
 
-    /** Quick probe used by the GUI to prefer gRPC and fall back to RMI. */
+    /** Checks whether the gRPC Bootstrap is reachable. */
     public boolean isAvailable() {
         try {
             listWorkers();

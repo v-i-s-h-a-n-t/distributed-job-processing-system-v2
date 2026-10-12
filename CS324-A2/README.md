@@ -5,9 +5,6 @@ inter-process communication. Worker processes form an unstructured network,
 elect a coordinator, accept jobs from multiple clients, and split work across
 available workers using Java threads.
 
-The original Java RMI implementation is still in the repository for reference
-but is not used by the system below.
-
 ## Requirements
 
 Java 17, Maven 3.9+
@@ -139,7 +136,8 @@ GUI bar keeps advancing because it follows replicated state.
 mvn test
 ```
 
-129 tests across 18 classes. Targeted runs:
+Tests cover the gRPC membership, scheduling, progress, client, and coordinator
+recovery paths. Targeted runs:
 
 ```bash
 mvn -Dtest=BootstrapGrpcServiceTest test    # membership, leases, watch stream
@@ -147,17 +145,6 @@ mvn -Dtest=CoordinatorElectionTest test     # terms, votes, split-brain
 mvn -Dtest=CoordinatorFailoverTest test     # kill the leader mid-job
 mvn -Dtest=CoordinatorProgressTest test     # progress streaming
 mvn -Dtest=GrpcClientServiceTest test       # discovery, submit, progress
-```
-
-## Legacy RMI cluster
-
-Assignment 1 code, kept for reference. It uses its own Bootstrap on port 1099
-and is not part of the gRPC system. Pointing the GUI at port 1099 runs jobs over
-RMI with indeterminate progress bars.
-
-```bash
-mvn exec:java -Dexec.mainClass=com.cs324a2.bootstrap.BootstrapNode -Dexec.args="1099"
-mvn exec:java -Dexec.mainClass=com.cs324a2.worker.WorkerNode -Dexec.args="1 localhost 1099"
 ```
 
 ## Authors

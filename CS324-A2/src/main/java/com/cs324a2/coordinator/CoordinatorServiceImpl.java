@@ -16,9 +16,8 @@ import com.cs324a2.grpc.coordinator.RequestVoteResponse;
 import io.grpc.stub.StreamObserver;
 
 /**
- * gRPC boundary for the coordinator contract. All election RPCs travel here,
- * replacing the legacy RMI {@code propagateElection / propagateCoordinator}
- * path. Each handler delegates to the owning {@link CoordinatorNode}, which
+ * gRPC boundary for the coordinator contract. All election RPCs travel here.
+ * Each handler delegates to the owning {@link CoordinatorNode}, which
  * owns terms, votes, heartbeats, replication, and job execution.
  */
 final class CoordinatorServiceImpl

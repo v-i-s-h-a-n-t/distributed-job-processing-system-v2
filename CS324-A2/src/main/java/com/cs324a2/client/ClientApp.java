@@ -132,8 +132,6 @@ public class ClientApp extends JFrame {
      * history rows can be cleared while other jobs are still running.
      */
     private final Map<String, JobProgressUpdate> progressByJob = new ConcurrentHashMap<>();
-    /** Jobs submitted via the legacy RMI path (absent means gRPC streaming). */
-    private final Map<String, Boolean> rmiByJob = new ConcurrentHashMap<>();
     /** Active progress-stream handles per job, cancelled on completion/dispose. */
     private final Map<String, GrpcClientService.ProgressHandle> progressHandles =
             new ConcurrentHashMap<>();
@@ -559,24 +557,17 @@ public class ClientApp extends JFrame {
         try {
             submitPool.submit(() -> {
                 try {
-                    // Prefer gRPC Bootstrap; fall back to legacy RMI registry.
-                    int n = -1;
                     try (GrpcClientService grpc = new GrpcClientService(host, port)) {
-                        n = grpc.listWorkers().size();
-                    } catch (RuntimeException grpcDown) {
-                        List<String> workers =
-                                new ClientService(host, port).activeWorkerAddresses();
-                        n = workers.size();
+                        int count = grpc.listWorkers().size();
+                        SwingUtilities.invokeLater(() -> {
+                            statusLabel.setText("●  " + count
+                                    + (count == 1 ? " worker online" : " workers online"));
+                            statusLabel.setForeground(count > 0 ? GREEN : MUTED);
+                            statusLabel.setBackground(count > 0
+                                    ? new Color(0xF0FDF4) : new Color(0xF8FAFC));
+                            statusLabel.setOpaque(true);
+                        });
                     }
-                    int count = n;
-                    SwingUtilities.invokeLater(() -> {
-                        statusLabel.setText("●  " + count
-                                + (count == 1 ? " worker online" : " workers online"));
-                        statusLabel.setForeground(count > 0 ? GREEN : MUTED);
-                        statusLabel.setBackground(count > 0
-                                ? new Color(0xF0FDF4) : new Color(0xF8FAFC));
-                        statusLabel.setOpaque(true);
-                    });
                 } catch (Exception ex) {
                     SwingUtilities.invokeLater(() -> {
                         statusLabel.setText("●  Disconnected");
@@ -598,14 +589,6 @@ public class ClientApp extends JFrame {
         int total = tableModel.getRowCount();
         SwingUtilities.invokeLater(() -> runningLabel.setText(
                 n + " running  ·  " + total + " jobs"));
-    }
-
-    private ClientService service() {
-        return new ClientService(hostField.getText().trim(), readPort());
-    }
-
-    private GrpcClientService grpcService() {
-        return new GrpcClientService(hostField.getText().trim(), readPort());
     }
 
     private String grpcHost() {
@@ -728,29 +711,12 @@ public class ClientApp extends JFrame {
         addRow(jobId, op, inputSummary);
         running.incrementAndGet();
         updateRunning();
-        ClientService rmiSvc = service();
         String host = grpcHost();
         int port = grpcPort();
         new SwingWorker<Long, Void>() {
             @Override
             protected Long doInBackground() throws Exception {
                 return submitPool.submit(() -> {
-                    // Prefer gRPC (with live progress streaming); fall back to
-                    // legacy RMI when the Bootstrap is not speaking gRPC.
-                    boolean grpcUp;
-                    try (GrpcClientService probe = new GrpcClientService(host, port)) {
-                        grpcUp = probe.isAvailable();
-                    } catch (RuntimeException e) {
-                        grpcUp = false;
-                    }
-                    if (!grpcUp) {
-                        setRmiMode(jobId);
-                        try {
-                            return rmiSvc.submit(request);
-                        } catch (Exception e) {
-                            throw new RuntimeException(e);
-                        }
-                    }
                     GrpcClientService grpc = new GrpcClientService(host, port);
                     try {
                         GrpcClientService.ProgressHandle handle =
@@ -825,7 +791,6 @@ public class ClientApp extends JFrame {
     private void addRow(String jobId, ComputeOperation op, String input) {
         tableModel.addRow(new Object[]{jobId, op, input, "RUNNING", 0, ""});
         progressByJob.remove(jobId);
-        rmiByJob.remove(jobId);
     }
 
     /** Finds a job's current row by ID. Returns -1 when cleared. Call on the EDT. */
@@ -846,14 +811,6 @@ public class ClientApp extends JFrame {
                 // Best effort.
             }
         }
-    }
-
-    private void setRmiMode(String jobId) {
-        rmiByJob.put(jobId, Boolean.TRUE);
-        SwingUtilities.invokeLater(() -> {
-            int row = findRow(jobId);
-            if (row >= 0) tableModel.fireTableRowsUpdated(row, row);
-        });
     }
 
     /** Applies one streamed update: percent from actual completed tasks. */
@@ -878,7 +835,7 @@ public class ClientApp extends JFrame {
             if (row < 0) return; // cleared from history; nothing to paint
             tableModel.setValueAt(status, row, COL_STATUS);
             tableModel.setValueAt(result, row, COL_RESULT);
-            if (!"DONE".equals(status) || rmiByJob.containsKey(jobId)) {
+            if (!"DONE".equals(status)) {
                 return;
             }
             // A finished job is 100% by definition. The terminal streamed update
@@ -909,7 +866,7 @@ public class ClientApp extends JFrame {
 
     /** Removes DONE/FAILED rows; RUNNING rows (and their live streams) are kept. */
     private void clearFinishedJobs() {
-        int removed = removeFinishedRows(tableModel, progressByJob, rmiByJob, progressHandles);
+        int removed = removeFinishedRows(tableModel, progressByJob, progressHandles);
         if (removed > 0) updateRunning();
     }
 
@@ -924,7 +881,6 @@ public class ClientApp extends JFrame {
      */
     static int removeFinishedRows(DefaultTableModel model,
                                   Map<String, JobProgressUpdate> progressByJob,
-                                  Map<String, Boolean> rmiByJob,
                                   Map<String, GrpcClientService.ProgressHandle> handles) {
         List<String> finished = new ArrayList<>();
         for (int row = 0; row < model.getRowCount(); row++) {
@@ -935,7 +891,6 @@ public class ClientApp extends JFrame {
         java.util.Set<String> drop = new java.util.HashSet<>(finished);
         for (String jobId : drop) {
             progressByJob.remove(jobId);
-            rmiByJob.remove(jobId);
             GrpcClientService.ProgressHandle handle = handles.remove(jobId);
             if (handle != null) {
                 try {
@@ -959,7 +914,6 @@ public class ClientApp extends JFrame {
     private void showBreakdown(int modelRow) {
         if (modelRow < 0 || modelRow >= tableModel.getRowCount()) return;
         String jobId = String.valueOf(tableModel.getValueAt(modelRow, 0));
-        boolean rmi = rmiByJob.containsKey(jobId);
         JobProgressUpdate snapshot = progressByJob.get(jobId);
         JDialog dialog = new JDialog(this,
                 "Job progress — " + jobId, false);
@@ -1020,16 +974,9 @@ public class ClientApp extends JFrame {
             JobProgressUpdate streamed = progressByJob.get(jobId);
             if (streamed != null) latest.set(streamed);
             JobProgressUpdate cur = latest.get();
-            boolean isRmi = rmiByJob.containsKey(jobId);
             int row = findRow(jobId);
             String status = row < 0 ? "CLEARED"
                     : String.valueOf(tableModel.getValueAt(row, COL_STATUS));
-            if (isRmi) {
-                summary.setText("RMI job — no streamed checkpoints. "
-                        + "Connect to the gRPC cluster for live worker detail. "
-                        + "Status: " + status);
-                return;
-            }
             if (cur == null) {
                 summary.setText("Waiting for the first streamed checkpoint… "
                         + "Status: " + status);
@@ -1222,8 +1169,7 @@ public class ClientApp extends JFrame {
 
     /**
      * Determinate progress bar for the Progress column. Values are Integer
-     * 0-100 from streamed checkpoints; RMI-fallback rows render an
-     * indeterminate bar while RUNNING. The cell tooltip invites the click-through
+     * 0-100 from streamed checkpoints. The cell tooltip invites the click-through
      * to the worker breakdown.
      */
     private final class ProgressRenderer extends JProgressBar implements TableCellRenderer {
@@ -1240,14 +1186,7 @@ public class ClientApp extends JFrame {
                 boolean selected, boolean focused, int row, int column) {
             int modelRow = table.convertRowIndexToModel(row);
             String jobId = String.valueOf(table.getModel().getValueAt(modelRow, 0));
-            boolean rmi = rmiByJob.containsKey(jobId);
-            String status = String.valueOf(table.getModel().getValueAt(modelRow, COL_STATUS));
-            if (rmi) {
-                setIndeterminate("RUNNING".equals(status));
-                setValue("RUNNING".equals(status) ? 50 : 0);
-                setString("RUNNING".equals(status) ? "…" : "n/a");
-                setToolTipText("RMI job — connect to the gRPC cluster for live progress");
-            } else if (value instanceof Number number) {
+            if (value instanceof Number number) {
                 setIndeterminate(false);
                 int pct = Math.max(0, Math.min(100, number.intValue()));
                 setValue(pct);

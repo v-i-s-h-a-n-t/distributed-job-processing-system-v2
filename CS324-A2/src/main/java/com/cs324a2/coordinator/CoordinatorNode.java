@@ -52,8 +52,7 @@ import java.util.concurrent.ThreadLocalRandom;
  *
  * <p>Each node serves task execution ({@code WorkerService}) and coordinator
  * duties ({@code CoordinatorService}) on one gRPC port, so every election RPC
- * (terms, votes, heartbeats, replication, submit) travels over gRPC instead of
- * the legacy RMI election path.
+ * (terms, votes, heartbeats, replication, submit) travels over gRPC.
  *
  * <p>Election is Raft-style:
  * <ul>

@@ -25,8 +25,6 @@ class ClientHistoryTest {
         Map<String, JobProgressUpdate> progress = new HashMap<>();
         progress.put("b", update("b"));
         progress.put("d", update("d"));
-        Map<String, Boolean> rmi = new HashMap<>();
-        rmi.put("c", Boolean.TRUE);
         Map<String, GrpcClientService.ProgressHandle> handles = new HashMap<>();
         AtomicBoolean bCancelled = new AtomicBoolean();
         AtomicBoolean cCancelled = new AtomicBoolean();
@@ -35,7 +33,7 @@ class ClientHistoryTest {
         handles.put("c", () -> cCancelled.set(true));
         handles.put("d", () -> dCancelled.set(true));
 
-        assertEquals(2, ClientApp.removeFinishedRows(model, progress, rmi, handles));
+        assertEquals(2, ClientApp.removeFinishedRows(model, progress, handles));
 
         assertEquals(2, model.getRowCount());
         assertEquals("a", model.getValueAt(0, 0));
@@ -44,7 +42,6 @@ class ClientHistoryTest {
         assertEquals("RUNNING", model.getValueAt(1, ClientApp.COL_STATUS));
 
         assertEquals(java.util.Set.of("d"), progress.keySet());
-        assertTrue(rmi.isEmpty());
         assertEquals(java.util.Set.of("d"), handles.keySet());
         assertTrue(bCancelled.get());
         assertTrue(cCancelled.get());
@@ -55,12 +52,11 @@ class ClientHistoryTest {
     void noFinishedRowsIsNoop() {
         DefaultTableModel model = model(row("a", "RUNNING"));
         Map<String, JobProgressUpdate> progress = new HashMap<>();
-        Map<String, Boolean> rmi = new HashMap<>();
         Map<String, GrpcClientService.ProgressHandle> handles = new HashMap<>();
         AtomicBoolean cancelled = new AtomicBoolean();
         handles.put("a", () -> cancelled.set(true));
 
-        assertEquals(0, ClientApp.removeFinishedRows(model, progress, rmi, handles));
+        assertEquals(0, ClientApp.removeFinishedRows(model, progress, handles));
 
         assertEquals(1, model.getRowCount());
         assertEquals(java.util.Set.of("a"), handles.keySet());
