@@ -115,7 +115,8 @@ class GrpcClientServiceTest {
             assertEquals(3, membership.snapshot().workers().size(),
                     "bootstrap membership should converge to 3 workers");
         }
-        awaitSingleLeader(20_000);
+        assertEquals(0, nodes.stream().filter(CoordinatorNode::isLeader).count(),
+                "no election should run before the first job");
 
         // The GUI path: discovery + submit + streaming, all over gRPC.
         try (GrpcClientService gui = new GrpcClientService("localhost", bootstrapPort)) {
@@ -143,6 +144,7 @@ class GrpcClientServiceTest {
 
             long result = gui.submit(JobRequest.max(jobId, List.of(5, 1, 9, 3, 7, 2)));
             assertEquals(9L, result);
+            awaitSingleLeader(20_000);
             assertTrue(terminal.await(30, TimeUnit.SECONDS),
                     "progress stream should reach a terminal update");
             handle.cancel();

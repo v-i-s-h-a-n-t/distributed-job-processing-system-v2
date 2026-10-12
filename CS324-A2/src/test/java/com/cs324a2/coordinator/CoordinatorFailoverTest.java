@@ -86,6 +86,7 @@ class CoordinatorFailoverTest {
         CoordinatorNode third = start(3, ports[2], membership, rpc, config);
 
         // 1. A replacement can only be shown after an initial leader exists.
+        first.initiateElection();
         CoordinatorNode leader = awaitSingleLeader(
                 List.of(first, second, third), 20_000);
         System.out.printf("[Failover] initial leader=%d term=%d progress=%d%n",

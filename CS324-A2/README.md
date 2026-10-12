@@ -142,7 +142,9 @@ Election is the Assignment-1 unstructured JAC flood over gRPC:
 
 - Workers form an unstructured overlay (each node links to a subset of peers;
   a joining node links to one random active worker, bilaterally).
-- When no live coordinator holds the term, any worker may initiate: an
+- The first submitted job starts an election when no coordinator exists.
+  After a coordinator has served, a heartbeat timeout can also start an
+  election to recover from failure. Any worker may initiate: an
   `ELECTION` message floods neighbours-except-sender, duplicates are ignored
   via `seenElectionIds`, and each subtree convergecasts its best candidate, so
   all reachable active workers are considered.

@@ -79,6 +79,7 @@ class CoordinatorProgressTest {
         CoordinatorNode second = start(2, ports[1], membership, rpc, config);
         CoordinatorNode third = start(3, ports[2], membership, rpc, config);
 
+        first.initiateElection();
         CoordinatorNode leader = awaitSingleLeader(List.of(first, second, third), 20_000);
         List<CoordinatorNode> followers = List.of(first, second, third).stream()
                 .filter(node -> node != leader).toList();

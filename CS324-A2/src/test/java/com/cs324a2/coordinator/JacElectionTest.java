@@ -130,6 +130,12 @@ class JacElectionTest {
         CoordinatorNode third = start(3, ports[2], membership, rpc, config);
         List<CoordinatorNode> all = List.of(first, second, third);
 
+        Thread.sleep(1_200);
+        for (CoordinatorNode node : all) {
+            assertEquals(0, node.electionCount(), "startup must not trigger an election");
+        }
+        assertEquals(9L, first.submitJob(
+                JobRequest.max("jac-term-job-1", List.of(3, 7, 1, 9))));
         // All JACs are zero, so the highest ID must win and all must agree.
         CoordinatorNode leader = awaitSingleLeader(all, 20_000);
         assertEquals(3, leader.workerId());
@@ -155,7 +161,7 @@ class JacElectionTest {
 
         // Five jobs on the leader exhaust the term; leadership must rotate to
         // the lowest JAC (one of the zero-JAC followers, i.e. worker 2).
-        for (int i = 1; i <= 5; i++) {
+        for (int i = 2; i <= 5; i++) {
             long result = leader.submitJob(
                     JobRequest.max("jac-term-job-" + i, List.of(3, 7, 1, 9)));
             assertEquals(9L, result);

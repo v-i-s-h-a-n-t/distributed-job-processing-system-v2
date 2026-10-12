@@ -470,6 +470,9 @@ public final class CoordinatorNode implements AutoCloseable {
     }
 
     CoordinatorJobResponse handleSubmit(JobSpec spec) {
+        if (!isLeader() && !hasLiveLeader()) {
+            initiateElection();
+        }
         CoordinatorJobResponse.Builder response = CoordinatorJobResponse.newBuilder()
                 .setTerm(getCurrentTerm());
         LeaderHint hint = leaderHint();
@@ -671,9 +674,10 @@ public final class CoordinatorNode implements AutoCloseable {
                         >= TimeUnit.MILLISECONDS.toNanos(HEARTBEAT_INTERVAL_MILLIS)) {
                     broadcastHeartbeats();
                 }
-            } else if (System.nanoTime() - lastHeartbeatNanos
+            } else if (getCurrentTerm() > 0 && System.nanoTime() - lastHeartbeatNanos
                     >= TimeUnit.MILLISECONDS.toNanos(electionTimeoutMillis)) {
-                // Primary path: unstructured JAC flood election over gRPC.
+                // Do not elect during idle startup. The first job starts the
+                // election; timeouts only recover an established term.
                 long silentMs = TimeUnit.NANOSECONDS.toMillis(
                         System.nanoTime() - lastHeartbeatNanos);
                 System.out.printf("[Coordinator %d] no heartbeat from leader %s for %dms"
