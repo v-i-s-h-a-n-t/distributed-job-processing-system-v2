@@ -85,6 +85,27 @@ class ClientHistoryTest {
         assertEquals("j", done.getJobId());
     }
 
+    @Test
+    void lateStreamedCheckpointStillSuppliesFinishedJobBreakdown() {
+        JobProgressUpdate active = JobProgressUpdate.newBuilder()
+                .setJobId("late").setTotalTasks(2).setCompletedTasks(1)
+                .setCompletionFraction(0.5).setProgressIndex(4)
+                .setStatus(com.cs324a2.grpc.coordinator.JobStatus.JOB_ACTIVE)
+                .addWorkerBreakdown(com.cs324a2.grpc.coordinator.WorkerProgress.newBuilder()
+                        .setWorkerId(2).setTotalTasks(2).setCompletedTasks(1).build())
+                .build();
+        JobProgressUpdate retained = ClientApp.progressForFinishedJob(null, active);
+        assertEquals(1.0, retained.getCompletionFraction());
+        assertEquals(1, retained.getWorkerBreakdownCount());
+
+        JobProgressUpdate terminal = active.toBuilder().setProgressIndex(5)
+                .setCompletedTasks(2).setCompletionFraction(1.0)
+                .setStatus(com.cs324a2.grpc.coordinator.JobStatus.JOB_COMPLETED)
+                .build();
+        assertEquals(terminal, ClientApp.progressForFinishedJob(retained, terminal));
+        assertEquals(terminal, ClientApp.progressForFinishedJob(terminal, active));
+    }
+
     private static DefaultTableModel model(Object[]... rows) {
         DefaultTableModel model = new DefaultTableModel(
                 new Object[]{"Job", "Operation", "Input", "Status", "Progress", "Result"}, 0);

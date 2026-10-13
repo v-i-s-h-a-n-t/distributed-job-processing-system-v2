@@ -4,15 +4,20 @@ import com.cs324a2.bootstrap.BootstrapClient;
 import com.cs324a2.common.JobRequest;
 import com.cs324a2.grpc.bootstrap.WorkerEndpoint;
 import com.cs324a2.grpc.coordinator.CoordinatorJobResponse;
+import com.cs324a2.grpc.coordinator.JobStateProto;
 import com.cs324a2.grpc.coordinator.JobProgressUpdate;
 import com.cs324a2.grpc.coordinator.JobSpec;
 import com.cs324a2.grpc.coordinator.JobStatus;
+import com.cs324a2.grpc.coordinator.TaskStatus;
+import com.cs324a2.grpc.coordinator.WorkerProgress;
 import io.grpc.Status;
 import io.grpc.StatusRuntimeException;
 import java.util.ArrayList;
 import java.util.Comparator;
 import java.util.Iterator;
 import java.util.List;
+import java.util.Map;
+import java.util.HashMap;
 import java.util.concurrent.atomic.AtomicBoolean;
 
 /**
@@ -59,6 +64,58 @@ public final class GrpcClientService implements AutoCloseable {
         } catch (RuntimeException e) {
             return false;
         }
+    }
+
+    /** Reads a retained checkpoint when a fast job outruns its progress stream. */
+    public JobProgressUpdate fetchJobProgress(String jobId) {
+        try (CoordinatorGrpcClient reader = new CoordinatorGrpcClient()) {
+            for (WorkerEndpoint endpoint : ordered(listWorkers())) {
+                try {
+                    var state = reader.getState(endpoint.getHost(), endpoint.getPort(), 2_000);
+                    for (JobStateProto job : state.getJobsList()) {
+                        if (!job.getJob().getJobId().equals(jobId)) continue;
+                        if (job.getStatus() != JobStatus.JOB_ACTIVE) {
+                            return progressFromState(job);
+                        }
+                    }
+                } catch (RuntimeException ignored) {
+                    // A task-only or unavailable worker cannot serve coordinator state.
+                }
+            }
+        }
+        return null;
+    }
+
+    private static JobProgressUpdate progressFromState(JobStateProto job) {
+        int total = job.getTasksCount();
+        int completed = 0, running = 0, pending = 0, failed = 0;
+        Map<Integer, int[]> perWorker = new HashMap<>();
+        for (var task : job.getTasksList()) {
+            int[] counts = perWorker.computeIfAbsent(task.getAssignedWorkerId(),
+                    ignored -> new int[5]);
+            counts[0]++;
+            TaskStatus status = task.getStatus();
+            if (status == TaskStatus.TASK_COMPLETED) { completed++; counts[1]++; }
+            else if (status == TaskStatus.TASK_RUNNING) { running++; counts[2]++; }
+            else if (status == TaskStatus.TASK_FAILED) { failed++; counts[4]++; }
+            else { pending++; counts[3]++; }
+        }
+        JobProgressUpdate.Builder update = JobProgressUpdate.newBuilder()
+                .setJobId(job.getJob().getJobId()).setTotalTasks(total)
+                .setCompletedTasks(completed).setRunningTasks(running)
+                .setPendingTasks(pending).setFailedTasks(failed)
+                .setCompletionFraction(total == 0 ? 1.0 : completed / (double) total)
+                .setProgressIndex(job.getProgressIndex()).setStatus(job.getStatus())
+                .setJobState(job).setHasResult(job.getHasResult())
+                .setResultValue(job.getResultValue()).setError(job.getError());
+        perWorker.entrySet().stream().sorted(Map.Entry.comparingByKey())
+                .forEach(entry -> update.addWorkerBreakdown(WorkerProgress.newBuilder()
+                        .setWorkerId(entry.getKey()).setTotalTasks(entry.getValue()[0])
+                        .setCompletedTasks(entry.getValue()[1])
+                        .setRunningTasks(entry.getValue()[2])
+                        .setPendingTasks(entry.getValue()[3])
+                        .setFailedTasks(entry.getValue()[4]).build()));
+        return update.build();
     }
 
     /** Submits a job through gRPC, following NOT_LEADER hints. */
@@ -168,7 +225,10 @@ public final class GrpcClientService implements AutoCloseable {
         // every endpoint fails consecutively without any update.
         int consecutiveFailures = 0;
         int index = 0;
-        while (!cancelled.get() && !closed) {
+        // The stream owns a separate CoordinatorGrpcClient from the submit
+        // channel. Closing this facade after SubmitJob returns must not stop
+        // progress delivery; the per-job ProgressHandle controls its lifetime.
+        while (!cancelled.get()) {
             WorkerEndpoint endpoint = endpoints.get(index % endpoints.size());
             index++;
             if (!CoordinatorGrpcClient.isReachable(endpoint)) {

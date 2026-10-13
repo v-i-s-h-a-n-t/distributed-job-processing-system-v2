@@ -135,6 +135,10 @@ public class ClientApp extends JFrame {
     /** Active progress-stream handles per job, cancelled on completion/dispose. */
     private final Map<String, GrpcClientService.ProgressHandle> progressHandles =
             new ConcurrentHashMap<>();
+    /** Completion can race subscription-handle publication on the stream thread. */
+    private final java.util.Set<String> finishedProgressStreams =
+            ConcurrentHashMap.newKeySet();
+    private final java.util.Set<String> progressFetches = ConcurrentHashMap.newKeySet();
 
     private final JLabel statusLabel = new JLabel("0 workers online");
     private final JLabel runningLabel = new JLabel("0 running");
@@ -730,7 +734,7 @@ public class ClientApp extends JFrame {
                                                     // Terminal checkpoint seen: drop the
                                                     // handle so the stream's own
                                                     // completion cleans it up.
-                                                    releaseStream(jobId);
+                                                    finishProgressStream(jobId);
                                                 }
                                             }
 
@@ -738,18 +742,22 @@ public class ClientApp extends JFrame {
                                             public void onError(Throwable error) {
                                                 // Keep the submit's own outcome as the
                                                 // source of truth; progress simply stops.
-                                                releaseStream(jobId);
+                                                finishProgressStream(jobId);
                                             }
                                         });
+                        // The stream may emit a terminal event (or fail) before
+                        // subscribeProgress returns. Publish then recheck so an
+                        // early cleanup cannot leave a stale handle in the map.
                         progressHandles.put(jobId, handle);
+                        if (finishedProgressStreams.remove(jobId)) {
+                            releaseStream(jobId);
+                        }
                         try {
                             return grpc.submit(request);
                         } finally {
-                            // On the happy path the stream keeps running until the
-                            // coordinator sends its terminal checkpoint, so the bar
-                            // and breakdown reflect real task states. Only an
-                            // aborted submit needs the stream torn down now.
-                            releaseStream(jobId);
+                            // The progress stream has its own gRPC client and must
+                            // remain open after SubmitJob returns so the terminal
+                            // checkpoint and worker breakdown reach the GUI.
                             grpc.close();
                         }
                     } catch (Exception e) {
@@ -813,14 +821,33 @@ public class ClientApp extends JFrame {
         }
     }
 
+    private void finishProgressStream(String jobId) {
+        GrpcClientService.ProgressHandle handle = progressHandles.remove(jobId);
+        if (handle == null) {
+            // The callback can beat subscribeProgress() returning its handle.
+            finishedProgressStreams.add(jobId);
+            return;
+        }
+        finishedProgressStreams.remove(jobId);
+        try {
+            handle.cancel();
+        } catch (RuntimeException ignored) {
+            // Best effort.
+        }
+    }
+
     /** Applies one streamed update: percent from actual completed tasks. */
     void updateProgress(String jobId, JobProgressUpdate update) {
         if (update == null) return;
         int row = findRow(jobId);
         if (row < 0) return; // cleared from history; nothing to paint
         if ("DONE".equals(String.valueOf(tableModel.getValueAt(row, COL_STATUS)))) {
-            // The job already finished and its bar was normalised to 100%.
-            // A late in-flight update must never walk a finished bar backwards.
+            // SubmitJob can finish before the EDT handles the first streamed
+            // update. Keep its task snapshot for the breakdown while leaving
+            // the finished bar at 100%.
+            progressByJob.compute(jobId, (id, last) ->
+                    progressForFinishedJob(last, update));
+            table.repaint();
             return;
         }
         progressByJob.put(jobId, update);
@@ -845,7 +872,31 @@ public class ClientApp extends JFrame {
             tableModel.setValueAt(100, row, COL_PROGRESS);
             progressByJob.compute(jobId, (id, last) ->
                     last == null ? null : asCompleted(last));
+            if (!progressByJob.containsKey(jobId)) loadMissingProgress(jobId);
         });
+    }
+
+    /** Recover the final task snapshot if the stream missed a very short job. */
+    private void loadMissingProgress(String jobId) {
+        if (!progressFetches.add(jobId)) return;
+        String host = grpcHost();
+        int port = grpcPort();
+        try {
+            submitPool.submit(() -> {
+                try (GrpcClientService grpc = new GrpcClientService(host, port)) {
+                    JobProgressUpdate checkpoint = grpc.fetchJobProgress(jobId);
+                    if (checkpoint != null) {
+                        SwingUtilities.invokeLater(() -> updateProgress(jobId, checkpoint));
+                    }
+                } catch (RuntimeException ignored) {
+                    // The live stream may still deliver the checkpoint.
+                } finally {
+                    progressFetches.remove(jobId);
+                }
+            });
+        } catch (java.util.concurrent.RejectedExecutionException ignored) {
+            progressFetches.remove(jobId);
+        }
     }
 
     /**
@@ -862,6 +913,12 @@ public class ClientApp extends JFrame {
                 .setCompletionFraction(1.0)
                 .setStatus(JobStatus.JOB_COMPLETED)
                 .build();
+    }
+
+    static JobProgressUpdate progressForFinishedJob(JobProgressUpdate last,
+                                                     JobProgressUpdate update) {
+        if (last != null && update.getProgressIndex() < last.getProgressIndex()) return last;
+        return update.getStatus() == JobStatus.JOB_COMPLETED ? update : asCompleted(update);
     }
 
     /** Removes DONE/FAILED rows; RUNNING rows (and their live streams) are kept. */
@@ -915,6 +972,7 @@ public class ClientApp extends JFrame {
         if (modelRow < 0 || modelRow >= tableModel.getRowCount()) return;
         String jobId = String.valueOf(tableModel.getValueAt(modelRow, 0));
         JobProgressUpdate snapshot = progressByJob.get(jobId);
+        if (snapshot == null) loadMissingProgress(jobId);
         JDialog dialog = new JDialog(this,
                 "Job progress — " + jobId, false);
         dialog.setLayout(new BorderLayout(0, 10));
@@ -980,6 +1038,7 @@ public class ClientApp extends JFrame {
             if (cur == null) {
                 summary.setText("Waiting for the first streamed checkpoint… "
                         + "Status: " + status);
+                if ("DONE".equals(status)) loadMissingProgress(jobId);
                 return;
             }
             int pct = (int) Math.round(cur.getCompletionFraction() * 100.0);
@@ -1046,6 +1105,8 @@ public class ClientApp extends JFrame {
             }
         }
         progressHandles.clear();
+        finishedProgressStreams.clear();
+        progressFetches.clear();
         submitPool.shutdownNow();
         super.dispose();
     }

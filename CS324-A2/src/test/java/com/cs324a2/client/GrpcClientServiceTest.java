@@ -1,6 +1,7 @@
 package com.cs324a2.client;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
+import static org.junit.jupiter.api.Assertions.assertNotNull;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 
 import com.cs324a2.bootstrap.BootstrapGrpcService;
@@ -156,6 +157,11 @@ class GrpcClientServiceTest {
             assertEquals(last.getTotalTasks(), last.getCompletedTasks());
             assertEquals(1.0, last.getCompletionFraction(), 1e-9);
             assertTrue(last.getWorkerBreakdownCount() > 0);
+            JobProgressUpdate fetched = gui.fetchJobProgress(jobId);
+            assertNotNull(fetched);
+            assertEquals(JobStatus.JOB_COMPLETED, fetched.getStatus());
+            assertTrue(fetched.getWorkerBreakdownCount() > 0);
+            assertEquals(fetched.getTotalTasks(), fetched.getCompletedTasks());
         }
         // Coordinator-to-client path also works when the GUI talks to a follower
         // first: covered implicitly because submit() tries endpoints in order.

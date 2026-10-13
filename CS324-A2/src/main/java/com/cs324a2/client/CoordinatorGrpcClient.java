@@ -4,6 +4,8 @@ import com.cs324a2.grpc.bootstrap.WorkerEndpoint;
 import com.cs324a2.grpc.coordinator.CoordinatorJobRequest;
 import com.cs324a2.grpc.coordinator.CoordinatorJobResponse;
 import com.cs324a2.grpc.coordinator.CoordinatorServiceGrpc;
+import com.cs324a2.grpc.coordinator.GetCoordinatorStateRequest;
+import com.cs324a2.grpc.coordinator.GetCoordinatorStateResponse;
 import com.cs324a2.grpc.coordinator.JobProgressRequest;
 import com.cs324a2.grpc.coordinator.JobProgressUpdate;
 import com.cs324a2.grpc.coordinator.JobSpec;
@@ -91,6 +93,13 @@ public final class CoordinatorGrpcClient implements AutoCloseable {
         if (closed) throw new IllegalStateException("coordinator gRPC client is closed");
         return CoordinatorServiceGrpc.newBlockingStub(channelFor(host, port))
                 .subscribeJobProgress(JobProgressRequest.newBuilder().setJobId(jobId).build());
+    }
+
+    public GetCoordinatorStateResponse getState(String host, int port, long timeoutMillis) {
+        if (closed) throw new IllegalStateException("coordinator gRPC client is closed");
+        return CoordinatorServiceGrpc.newBlockingStub(channelFor(host, port))
+                .withDeadlineAfter(timeoutMillis, TimeUnit.MILLISECONDS)
+                .getCoordinatorState(GetCoordinatorStateRequest.getDefaultInstance());
     }
 
     /** Converts a domain job to its wire spec (mirrors CoordinatorJobMapper). */
