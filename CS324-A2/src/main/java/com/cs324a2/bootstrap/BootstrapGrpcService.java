@@ -170,7 +170,7 @@ public final class BootstrapGrpcService
                     && workers.remove(request.getWorkerId(), registration)) {
                 removed = true;
                 rpcFailures.remove(request.getWorkerId());
-                publishWorkerLeftLocked(registration.endpoint());
+                publishWorkerLeftLocked(registration.endpoint(), "deregistered");
             }
         }
 
@@ -194,7 +194,8 @@ public final class BootstrapGrpcService
                     int failures = rpcFailures.merge(request.getWorkerId(), 1, Integer::sum);
                     if (failures >= 2 && workers.remove(request.getWorkerId(), registration)) {
                         rpcFailures.remove(request.getWorkerId());
-                        publishWorkerLeftLocked(registration.endpoint());
+                        publishWorkerLeftLocked(registration.endpoint(),
+                                "removed after repeated RPC failures");
                         removed = true;
                     }
                 }
@@ -313,21 +314,22 @@ public final class BootstrapGrpcService
             if (now - registration.lastHeartbeatNanos() < heartbeatTimeoutNanos) {
                 return false;
             }
-            publishWorkerLeftLocked(registration.endpoint());
+            publishWorkerLeftLocked(registration.endpoint(),
+                    "expired after missed heartbeats");
             rpcFailures.remove(entry.getKey());
-            System.out.printf("Bootstrap expired worker %d after missed heartbeats%n",
-                    entry.getKey());
             return true;
         });
     }
 
-    private void publishWorkerLeftLocked(WorkerEndpoint endpoint) {
+    private void publishWorkerLeftLocked(WorkerEndpoint endpoint, String reason) {
         long version = ++membershipVersion;
         publishLocked(MembershipEvent.newBuilder()
                 .setType(MembershipEvent.Type.WORKER_LEFT)
                 .setWorker(endpoint)
                 .setMembershipVersion(version)
                 .build());
+        System.out.printf("Bootstrap worker %d at %s:%d %s%n",
+                endpoint.getWorkerId(), endpoint.getHost(), endpoint.getPort(), reason);
     }
 
     private void publishLocked(MembershipEvent event) {
