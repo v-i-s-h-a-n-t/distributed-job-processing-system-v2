@@ -26,7 +26,14 @@ public final class ReplicatedJobStore {
     public record TaskRecord(String taskId, WorkUnit unit, TaskState status,
                              int attempt, int assignedWorkerId,
                              Long resultValue, String lastFailure,
-                             long progressIndex) {}
+                             long progressIndex, String exactResultValue) {
+        public TaskRecord(String taskId, WorkUnit unit, TaskState status,
+                          int attempt, int assignedWorkerId, Long resultValue,
+                          String lastFailure, long progressIndex) {
+            this(taskId, unit, status, attempt, assignedWorkerId, resultValue,
+                    lastFailure, progressIndex, "");
+        }
+    }
 
     private final AtomicLong progressSeq = new AtomicLong(0);
     private final ConcurrentHashMap<String, JobRecord> jobs = new ConcurrentHashMap<>();
@@ -107,6 +114,7 @@ public final class ReplicatedJobStore {
                         Math.max(progressIndex, incoming.progressIndex()));
                 stored.status = incoming.status();
                 stored.resultValue = incoming.resultValue();
+                stored.exactResultValue = incoming.exactResultValue();
                 stored.error = incoming.error();
                 stored.progressIndex = Math.max(progressIndex, incoming.progressIndex());
                 for (TaskRecord task : incoming.tasks()) {
@@ -128,6 +136,7 @@ public final class ReplicatedJobStore {
         final ConcurrentHashMap<Integer, TaskRecord> tasks = new ConcurrentHashMap<>();
         volatile JobStatus status = JobStatus.ACTIVE;
         volatile Long resultValue;
+        volatile String exactResultValue = "";
         volatile String error;
         volatile long progressIndex;
         private final long term;
@@ -139,12 +148,14 @@ public final class ReplicatedJobStore {
         }
 
         JobRecord(JobRequest request, List<TaskRecord> tasks, JobStatus status,
-                  Long resultValue, String error, long progressIndex, long term) {
+                  Long resultValue, String exactResultValue, String error,
+                  long progressIndex, long term) {
             this.request = request;
             this.term = term;
             this.progressIndex = progressIndex;
             this.status = status;
             this.resultValue = resultValue;
+            this.exactResultValue = exactResultValue;
             this.error = error;
             for (TaskRecord task : tasks) this.tasks.put(task.unit().partitionId(), task);
         }
@@ -153,6 +164,7 @@ public final class ReplicatedJobStore {
         public JobRequest request() { return request; }
         public JobStatus status() { return status; }
         public Long resultValue() { return resultValue; }
+        public String exactResultValue() { return exactResultValue; }
         public String error() { return error; }
         public long progressIndex() { return progressIndex; }
         public long term() { return term; }
@@ -164,7 +176,7 @@ public final class ReplicatedJobStore {
         }
 
         synchronized JobRecord snapshot() {
-            return new JobRecord(request, tasks(), status, resultValue, error,
+            return new JobRecord(request, tasks(), status, resultValue, exactResultValue, error,
                     progressIndex, term);
         }
     }

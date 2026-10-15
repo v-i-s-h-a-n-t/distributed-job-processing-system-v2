@@ -99,6 +99,7 @@ message TaskStateProto {
   sint64 start = 11;
   sint64 end = 12;
   bool has_range = 13;
+  string exact_result_value = 14;
 }
 
 message JobStateProto {
@@ -112,6 +113,7 @@ message JobStateProto {
   int64 progress_index = 7;
   // Leader term that admitted the job.
   int64 term = 8;
+  string exact_result_value = 9;
 }
 
 message RequestVoteRequest {
@@ -175,6 +177,7 @@ message CoordinatorJobResponse {
   int32 leader_port = 8;
   // Progress event number of the terminal job mutation.
   int64 progress_index = 9;
+  string exact_result_value = 10;
 }
 
 message GetCoordinatorStateRequest {}
@@ -227,6 +230,7 @@ message JobProgressUpdate {
   // Full checkpoint snapshot so clients can render per-task detail.
   JobStateProto job_state = 13;
   repeated WorkerProgress worker_breakdown = 14;
+  string exact_result_value = 15;
 }
 
 // ---- Unstructured overlay + JAC election (Assignment 1 over gRPC) ----

@@ -54,6 +54,9 @@ final class CoordinatorJobMapper {
         if (task.resultValue() != null) {
             builder.setResultValue(task.resultValue()).setHasResult(true);
         }
+        if (!task.exactResultValue().isEmpty()) {
+            builder.setExactResultValue(task.exactResultValue()).setHasResult(true);
+        }
         WorkUnit unit = task.unit();
         if (unit.operation() == ComputeOperation.PRIMESUM) {
             builder.setStart(unit.start()).setEnd(unit.end()).setHasRange(true);
@@ -78,6 +81,9 @@ final class CoordinatorJobMapper {
         if (job.resultValue() != null) {
             builder.setResultValue(job.resultValue()).setHasResult(true);
         }
+        if (!job.exactResultValue().isEmpty()) {
+            builder.setExactResultValue(job.exactResultValue()).setHasResult(true);
+        }
         if (job.error() != null) builder.setError(job.error());
         return builder.build();
     }
@@ -93,7 +99,7 @@ final class CoordinatorJobMapper {
                     task.getAttempt(), task.getAssignedWorkerId(),
                     task.getHasResult() ? task.getResultValue() : null,
                     task.getLastFailure().isEmpty() ? null : task.getLastFailure(),
-                    task.getProgressIndex()));
+                    task.getProgressIndex(), task.getExactResultValue()));
         }
         ReplicatedJobStore.JobStatus status = switch (proto.getStatus()) {
             case JOB_COMPLETED -> ReplicatedJobStore.JobStatus.COMPLETED;
@@ -102,6 +108,7 @@ final class CoordinatorJobMapper {
         };
         return new ReplicatedJobStore.JobRecord(request, tasks, status,
                 proto.getHasResult() ? proto.getResultValue() : null,
+                proto.getExactResultValue(),
                 proto.getError().isEmpty() ? null : proto.getError(),
                 proto.getProgressIndex(), proto.getTerm());
     }

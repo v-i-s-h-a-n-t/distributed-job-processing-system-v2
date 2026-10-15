@@ -86,6 +86,7 @@ public final class JobParser {
     public static long[] loadPrimeSumRange(File file) throws IOException {
         try (BufferedReader reader = new BufferedReader(new FileReader(file))) {
             String line;
+            long[] range = null;
             while ((line = reader.readLine()) != null) {
                 line = line.trim();
                 if (line.isEmpty() || line.startsWith("#")) {
@@ -93,6 +94,10 @@ public final class JobParser {
                 }
                 if (line.matches("(?i)[a-z_,;\\s]+") && !line.matches(".*\\d.*")) {
                     continue; // header like "start,end"
+                }
+                if (range != null) {
+                    throw new IOException("expected one 'start,end' range in " + file.getName()
+                            + " but found another row: " + line);
                 }
                 String[] tokens = line.split("[,;\\s]+");
                 if (tokens.length < 2) {
@@ -106,11 +111,12 @@ public final class JobParser {
                     } catch (IllegalArgumentException e) {
                         throw new IOException(e.getMessage() + " in " + file.getName(), e);
                     }
-                    return new long[]{start, end};
+                    range = new long[]{start, end};
                 } catch (NumberFormatException e) {
                     throw new IOException("invalid range '" + line + "' in " + file.getName(), e);
                 }
             }
+            if (range != null) return range;
         }
         throw new IOException("no start,end range found in " + file.getName());
     }

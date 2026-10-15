@@ -13,6 +13,9 @@ import com.cs324a2.scheduler.JobExecutionException;
 import com.cs324a2.scheduler.SchedulerConfig;
 import com.cs324a2.scheduler.GrpcWorkerRpcClient;
 import com.cs324a2.scheduler.WorkerMembership;
+import com.cs324a2.scheduler.WorkerRpcClient;
+import com.cs324a2.worker.WorkUnitProcessor;
+import com.cs324a2.worker.WorkerProtoMapper;
 import io.grpc.ManagedChannel;
 import io.grpc.ManagedChannelBuilder;
 import io.grpc.Status;
@@ -174,6 +177,66 @@ class CoordinatorProgressTest {
     }
 
     @Test
+    void primeSumContinuesPastFirstChunkAndCheckpointsExactResult() throws Exception {
+        int port = freePort();
+        StaticMembership membership = new StaticMembership(List.of(endpoint(1, port)));
+        CoordinatorNode node = start(1, port, membership, new GrpcWorkerRpcClient(),
+                new SchedulerConfig(Duration.ofSeconds(5), Duration.ofSeconds(2),
+                        Duration.ofMillis(100), 3, 8, 128));
+        node.initiateElection();
+        JobRequest request = JobRequest.primeSum("chunked-primes", 1, 400_004);
+        long result = node.submitJob(request);
+        assertEquals(com.cs324a2.compute.ComputeEngine.primeSum(1, 400_004), result);
+        ReplicatedJobStore.JobRecord checkpoint = node.job(request.jobId());
+        assertEquals(Long.toString(result), checkpoint.exactResultValue());
+        assertTrue(checkpoint.tasks().stream().allMatch(t -> t.attempt() == 1));
+        assertEquals(1.0, CoordinatorNode.toProgressUpdate(checkpoint)
+                .getCompletionFraction(), 1e-9);
+
+        long start = Long.MAX_VALUE - 2_000;
+        JobRequest largeResult = JobRequest.primeSum("exact-primes", start, Long.MAX_VALUE);
+        node.submitJob(largeResult);
+        String exact = node.job(largeResult.jobId()).exactResultValue();
+        assertEquals(com.cs324a2.compute.ComputeEngine.primeSumExact(start, Long.MAX_VALUE)
+                .toString(), exact);
+        assertTrue(new java.math.BigInteger(exact)
+                .compareTo(java.math.BigInteger.valueOf(Long.MAX_VALUE)) > 0);
+        assertEquals(exact, node.handleSubmit(CoordinatorJobMapper.toSpec(largeResult))
+                .getExactResultValue());
+    }
+
+    @Test
+    void primeSumShrinksTimedOutChunksAndStillFinishes() throws Exception {
+        int port = freePort();
+        java.util.concurrent.atomic.AtomicInteger timeouts =
+                new java.util.concurrent.atomic.AtomicInteger();
+        WorkerRpcClient rpc = new WorkerRpcClient() {
+            @Override public com.cs324a2.grpc.worker.ExecuteTaskResponse execute(
+                    WorkerEndpoint worker,
+                    com.cs324a2.grpc.worker.ExecuteTaskRequest request,
+                    Duration timeout) {
+                var unit = WorkerProtoMapper.toWorkUnit(request);
+                if (unit.end() - unit.start() + 1 > 100) {
+                    timeouts.incrementAndGet();
+                    throw Status.DEADLINE_EXCEEDED.asRuntimeException();
+                }
+                return WorkerProtoMapper.toResponse(request, worker.getWorkerId(),
+                        new WorkUnitProcessor().execute(unit));
+            }
+            @Override public void retainWorkers(long version, java.util.Collection<WorkerEndpoint> workers) {}
+            @Override public void close() {}
+        };
+        CoordinatorNode node = start(1, port,
+                new StaticMembership(List.of(endpoint(1, port))), rpc,
+                new SchedulerConfig(Duration.ofSeconds(1), Duration.ofSeconds(1),
+                        Duration.ofMillis(100), 3, 8, 128));
+        node.initiateElection();
+        assertEquals(com.cs324a2.compute.ComputeEngine.primeSum(1, 4_000),
+                node.submitJob(JobRequest.primeSum("adaptive", 1, 4_000)));
+        assertTrue(timeouts.get() > 0);
+    }
+
+    @Test
     void manyRangeTasksStillProduceCorrectResult() {
         // Guard the granular split end-to-end at the partitioner level.
         var request = JobRequest.primeSum("wide", 1, 1_000_000);
@@ -246,7 +309,7 @@ class CoordinatorProgressTest {
     // ---- Helpers ----
 
     private CoordinatorNode start(int workerId, int port, WorkerMembership membership,
-                                  GrpcWorkerRpcClient rpc, SchedulerConfig config)
+                                  WorkerRpcClient rpc, SchedulerConfig config)
             throws Exception {
         CoordinatorNode node = new CoordinatorNode(workerId, "localhost", port,
                 membership, rpc, config);

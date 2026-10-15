@@ -33,9 +33,9 @@ public final class CoordinatorGrpcClient implements AutoCloseable {
 
     public CoordinatorJobResponse submit(String host, int port, JobSpec job, long timeoutMillis) {
         if (closed) throw new IllegalStateException("coordinator gRPC client is closed");
-        return CoordinatorServiceGrpc.newBlockingStub(channelFor(host, port))
-                .withDeadlineAfter(timeoutMillis, TimeUnit.MILLISECONDS)
-                .submitJob(CoordinatorJobRequest.newBuilder().setJob(job).build());
+        var stub = CoordinatorServiceGrpc.newBlockingStub(channelFor(host, port));
+        if (timeoutMillis > 0) stub = stub.withDeadlineAfter(timeoutMillis, TimeUnit.MILLISECONDS);
+        return stub.submitJob(CoordinatorJobRequest.newBuilder().setJob(job).build());
     }
 
     /** Async server-streaming subscribe; caller gets a handle to cancel. */

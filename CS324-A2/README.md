@@ -114,10 +114,13 @@ Clear finished removes DONE and FAILED rows. Running jobs keep their streams.
 returns 0. `PRIMESUM` takes an inclusive 64-bit range, read and validated in
 64-bit space with no silent rounding or clamping.
 
-The span `end - start + 1` is capped at 100,000,000 values
-(`JobRequest.MAX_RANGE_SPAN`), checked on typed, CSV, and submitted input alike.
-The sieve handles endpoints up to 2,500,000,000,000,000. Sums that overflow a
-64-bit result fail with an error.
+There is no fixed PRIMESUM span cap. The coordinator checkpoints each bounded
+chunk and resumes the next chunk after it finishes; failed worker RPCs can be
+retried without discarding completed chunks, and timed-out chunks are split
+into smaller ranges. Sums are carried as decimal
+arbitrary-precision integers through the worker, checkpoints, and GUI. Very
+large ranges can still take impractically long, and all coordinators losing
+their in-memory state loses the job.
 
 ## Failure handling
 

@@ -4,12 +4,18 @@ import com.cs324a2.common.ComputeOperation;
 import com.cs324a2.common.JobRequest;
 import com.cs324a2.common.WorkUnit;
 import java.util.ArrayList;
+import java.math.BigInteger;
 import java.util.List;
 
 /**
  * Splits validated jobs into deterministic, balanced work units.
  */
 public final class WorkPartitioner {
+    public static final long PRIME_SUM_CHUNK_SIZE = 100_000L;
+
+    public static long primeSumChunkSize(long end) {
+        return end > 1_000_000_000_000L ? 256L : PRIME_SUM_CHUNK_SIZE;
+    }
 
     private WorkPartitioner() {
         // Utility class
@@ -63,23 +69,40 @@ public final class WorkPartitioner {
 
     private static List<WorkUnit> partitionRange(
             JobRequest request, int requestedPartitions) {
-        long valueCount = (long) request.end() - request.start() + 1L;
-        int partitionCount = (int) Math.min((long) requestedPartitions, valueCount);
-        long baseSize = valueCount / partitionCount;
-        long remainder = valueCount % partitionCount;
+        BigInteger valueCount = BigInteger.valueOf(request.end())
+                .subtract(BigInteger.valueOf(request.start())).add(BigInteger.ONE);
+        int partitionCount = valueCount.min(BigInteger.valueOf(requestedPartitions)).intValueExact();
         List<WorkUnit> partitions = new ArrayList<>(partitionCount);
-
-        long nextStart = request.start();
         for (int partitionId = 0; partitionId < partitionCount; partitionId++) {
-            long partitionSize = baseSize + (partitionId < remainder ? 1L : 0L);
-            long partitionEnd = nextStart + (partitionSize - 1L);
+            BigInteger[] bounds = rangeBounds(request, partitionCount, partitionId);
+            long nextStart = bounds[0].longValueExact();
+            long partitionEnd = bounds[1].min(bounds[0].add(
+                    BigInteger.valueOf(primeSumChunkSize(request.end()) - 1))).longValueExact();
             partitions.add(WorkUnit.primeSum(
                     request.jobId(), partitionId, nextStart, partitionEnd));
-            if (partitionId + 1 < partitionCount) {
-                nextStart = partitionEnd + 1L;
-            }
         }
 
         return List.copyOf(partitions);
+    }
+
+    public static long partitionEnd(JobRequest request, int partitionCount, int partitionId) {
+        return rangeBounds(request, partitionCount, partitionId)[1].longValueExact();
+    }
+
+    public static BigInteger[] partitionBounds(JobRequest request, int partitionCount,
+                                               int partitionId) {
+        return rangeBounds(request, partitionCount, partitionId);
+    }
+
+    private static BigInteger[] rangeBounds(JobRequest request, int count, int id) {
+        BigInteger start = BigInteger.valueOf(request.start());
+        BigInteger[] division = BigInteger.valueOf(request.end()).subtract(start)
+                .add(BigInteger.ONE).divideAndRemainder(BigInteger.valueOf(count));
+        BigInteger index = BigInteger.valueOf(id);
+        BigInteger offset = division[0].multiply(index)
+                .add(index.min(division[1]));
+        BigInteger size = division[0].add(id < division[1].intValue() ? BigInteger.ONE : BigInteger.ZERO);
+        BigInteger first = start.add(offset);
+        return new BigInteger[]{first, first.add(size).subtract(BigInteger.ONE)};
     }
 }

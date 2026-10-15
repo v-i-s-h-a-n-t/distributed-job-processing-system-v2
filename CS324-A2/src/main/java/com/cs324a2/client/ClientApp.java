@@ -531,8 +531,7 @@ public class ClientApp extends JFrame {
         jobDescriptionLabel.setText(switch (op) {
             case MAX -> "Enter integers separated by commas, spaces, or new lines. Returns the largest value.";
             case PRIMECOUNT -> "Enter integers to count. Duplicate prime values are counted separately.";
-            case PRIMESUM -> "Choose an inclusive start and end (max span "
-                    + JobRequest.MAX_RANGE_SPAN + " values). Large ranges can take longer to finish.";
+            case PRIMESUM -> "Choose an inclusive start and end. Large ranges may take a long time.";
         });
         inputLayout.show(inputPanel, isRange ? "range" : "numbers");
     }
@@ -707,7 +706,7 @@ public class ClientApp extends JFrame {
         try {
             if (op == ComputeOperation.PRIMESUM) {
                 // Flush typed-but-uncommitted editor text, read as longs, and
-                // enforce the shared span cap before building the request.
+                // validate the inclusive range before building the request.
                 long start = commitAndReadLong(startField, "start");
                 long end = commitAndReadLong(endField, "end");
                 JobRequest.checkRangeSpan(start, end);
@@ -735,9 +734,9 @@ public class ClientApp extends JFrame {
         updateRunning();
         String host = grpcHost();
         int port = grpcPort();
-        new SwingWorker<Long, Void>() {
+        new SwingWorker<String, Void>() {
             @Override
-            protected Long doInBackground() throws Exception {
+            protected String doInBackground() throws Exception {
                 return submitPool.submit(() -> {
                     GrpcClientService grpc = new GrpcClientService(host, port);
                     try {
@@ -771,7 +770,7 @@ public class ClientApp extends JFrame {
                             releaseStream(jobId);
                         }
                         try {
-                            return grpc.submit(request);
+                            return grpc.submitExact(request);
                         } finally {
                             // The progress stream has its own gRPC client and must
                             // remain open after SubmitJob returns so the terminal
@@ -795,8 +794,8 @@ public class ClientApp extends JFrame {
                 running.decrementAndGet();
                 updateRunning();
                 try {
-                    long result = get();
-                    updateRow(jobId, "DONE", String.valueOf(result));
+                    String result = get();
+                    updateRow(jobId, "DONE", result);
                 } catch (Exception e) {
                     Throwable cause = e;
                     while (cause.getCause() != null) cause = cause.getCause();
@@ -1075,7 +1074,8 @@ public class ClientApp extends JFrame {
             taskModel.setRowCount(0);
             if (cur.hasJobState()) {
                 for (var t : cur.getJobState().getTasksList()) {
-                    String detail = t.getHasResult() ? String.valueOf(t.getResultValue())
+                    String detail = t.getHasResult() ? (t.getExactResultValue().isEmpty()
+                            ? String.valueOf(t.getResultValue()) : t.getExactResultValue())
                             : t.getLastFailure();
                     String worker = t.getAssignedWorkerId() < 0 ? "—"
                             : String.valueOf(t.getAssignedWorkerId());

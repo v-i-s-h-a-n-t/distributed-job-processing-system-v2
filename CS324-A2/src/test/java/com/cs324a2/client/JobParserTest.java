@@ -88,6 +88,20 @@ class JobParserTest {
     }
 
     @Test
+    void loadPrimeSumRangeRejectsMultipleDataRows() throws IOException {
+        Path file = write("2,10\n11,20\n");
+        assertThrows(IOException.class, () -> JobParser.loadPrimeSumRange(file.toFile()));
+        assertEquals(List.of(2, 10, 11, 20), JobParser.loadNumberList(file.toFile()));
+    }
+
+    @Test
+    void singleColumnNumberFileCanBeLoadedAfterRangeParseFails() throws IOException {
+        Path file = write("value\n77344\n22059\n");
+        assertThrows(IOException.class, () -> JobParser.loadPrimeSumRange(file.toFile()));
+        assertEquals(List.of(77344, 22059), JobParser.loadNumberList(file.toFile()));
+    }
+
+    @Test
     void loadPrimeSumRangeSkipsCommentsAndBlankLines() throws IOException {
         Path file = write("# range file\nstart end\n\n1 1000\n");
         assertArrayEquals(new long[]{1, 1000}, JobParser.loadPrimeSumRange(file.toFile()));
@@ -124,19 +138,17 @@ class JobParserTest {
     }
 
     @Test
-    void loadPrimeSumRangeAcceptsSpanAtSharedCap() throws IOException {
-        Path file = write("1," + JobRequest.MAX_RANGE_SPAN + "\n");
-        assertArrayEquals(new long[]{1, JobRequest.MAX_RANGE_SPAN},
+    void loadPrimeSumRangeAcceptsLargeSpan() throws IOException {
+        Path file = write("1,1000000000\n");
+        assertArrayEquals(new long[]{1, 1_000_000_000L},
                 JobParser.loadPrimeSumRange(file.toFile()));
     }
 
     @Test
-    void loadPrimeSumRangeRejectsSpanAboveSharedCap() throws IOException {
-        Path file = write("start,end\n1," + (JobRequest.MAX_RANGE_SPAN + 1) + "\n");
-        IOException e = assertThrows(IOException.class,
-                () -> JobParser.loadPrimeSumRange(file.toFile()));
-        assertTrue(e.getMessage().contains("exceeds the maximum"),
-                "CSV rejection should carry the shared span message, got: " + e.getMessage());
+    void loadPrimeSumRangeAcceptsFullLongDomain() throws IOException {
+        Path file = write("start,end\n" + Long.MIN_VALUE + "," + Long.MAX_VALUE + "\n");
+        assertArrayEquals(new long[]{Long.MIN_VALUE, Long.MAX_VALUE},
+                JobParser.loadPrimeSumRange(file.toFile()));
     }
 
     private Path write(String content) throws IOException {

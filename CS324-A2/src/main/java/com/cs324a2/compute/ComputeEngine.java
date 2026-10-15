@@ -1,6 +1,7 @@
 package com.cs324a2.compute;
 
 import java.util.List;
+import java.math.BigInteger;
 
 /**
  * Pure implementations of the computations supported by the job system.
@@ -37,10 +38,24 @@ public final class ComputeEngine {
      * @throws IllegalArgumentException if start is greater than end
      */
     public static long primeSum(long start, long end) {
+        return primeSumExact(start, end).longValueExact();
+    }
+
+    public static BigInteger primeSumExact(long start, long end) {
         if (start > end) {
             throw new IllegalArgumentException("start must not be greater than end");
         }
-        if (end < 2) return 0L;
+        if (end < 2) return BigInteger.ZERO;
+        if (end > 1_000_000_000_000L) {
+            BigInteger sum = BigInteger.ZERO;
+            long candidate = Math.max(2L, start);
+            while (candidate <= end) {
+                if (isPrimeLong(candidate)) sum = sum.add(BigInteger.valueOf(candidate));
+                if (candidate == end) break;
+                candidate++;
+            }
+            return sum;
+        }
         long baseLimit = (long) Math.sqrt(end);
         while ((baseLimit + 1) <= end / (baseLimit + 1)) baseLimit++;
         while (baseLimit > end / baseLimit) baseLimit--;
@@ -49,7 +64,7 @@ public final class ComputeEngine {
                     + (MAX_SIEVE_BASE * MAX_SIEVE_BASE) + ")");
         }
         int[] basePrimes = primesUpTo((int) baseLimit);
-        long sum = 0;
+        BigInteger sum = BigInteger.ZERO;
         long segmentStart = Math.max(2L, start);
         while (segmentStart <= end) {
             long remaining = end - segmentStart;
@@ -67,12 +82,41 @@ public final class ComputeEngine {
                 }
             }
             for (int offset = 0; offset < segmentLength; offset++) {
-                if (!composite[offset]) sum = Math.addExact(sum, segmentStart + offset);
+                if (!composite[offset]) sum = sum.add(BigInteger.valueOf(segmentStart + offset));
             }
             if (segmentEnd == end) break;
             segmentStart = segmentEnd + 1L;
         }
         return sum;
+    }
+
+    /** Deterministic Miller-Rabin for positive signed 64-bit values. */
+    private static boolean isPrimeLong(long value) {
+        if (value < 2) return false;
+        for (long p : new long[]{2, 3, 5, 7, 11, 13, 17, 19, 23, 29, 31, 37}) {
+            if (value == p) return true;
+            if (value % p == 0) return false;
+        }
+        BigInteger n = BigInteger.valueOf(value);
+        BigInteger nMinusOne = n.subtract(BigInteger.ONE);
+        int shifts = nMinusOne.getLowestSetBit();
+        BigInteger odd = nMinusOne.shiftRight(shifts);
+        for (long base : new long[]{2, 325, 9375, 28178, 450775, 9780504, 1795265022}) {
+            BigInteger a = BigInteger.valueOf(base).mod(n);
+            if (a.signum() == 0) continue;
+            BigInteger x = a.modPow(odd, n);
+            if (x.equals(BigInteger.ONE) || x.equals(nMinusOne)) continue;
+            boolean witness = true;
+            for (int i = 1; i < shifts; i++) {
+                x = x.multiply(x).mod(n);
+                if (x.equals(nMinusOne)) {
+                    witness = false;
+                    break;
+                }
+            }
+            if (witness) return false;
+        }
+        return true;
     }
 
     private static int[] primesUpTo(int limit) {

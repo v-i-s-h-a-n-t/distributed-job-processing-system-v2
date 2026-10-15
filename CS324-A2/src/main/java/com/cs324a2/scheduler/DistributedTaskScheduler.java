@@ -72,6 +72,14 @@ public final class DistributedTaskScheduler implements AutoCloseable {
         long jobDeadline = deadlineAfter(config.jobTimeout());
         WorkerMembership.Snapshot initial = awaitWorkers(jobDeadline);
         List<WorkUnit> units = WorkPartitioner.partition(request, initial.workers().size());
+        if (request.operation() == ComputeOperation.PRIMESUM) {
+            for (WorkUnit unit : units) {
+                if (unit.end() < WorkPartitioner.partitionEnd(
+                        request, units.size(), unit.partitionId())) {
+                    throw new JobExecutionException("large PRIMESUM jobs require the checkpointed coordinator API");
+                }
+            }
+        }
         List<TaskAssignment> tasks = new ArrayList<>(units.size());
         for (WorkUnit unit : units) {
             tasks.add(new TaskAssignment(taskId(unit), unit));

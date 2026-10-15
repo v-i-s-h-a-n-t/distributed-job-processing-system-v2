@@ -2,6 +2,7 @@ package com.cs324a2.client;
 
 import com.cs324a2.bootstrap.BootstrapClient;
 import com.cs324a2.common.JobRequest;
+import com.cs324a2.common.ComputeOperation;
 import com.cs324a2.grpc.bootstrap.WorkerEndpoint;
 import com.cs324a2.grpc.coordinator.CoordinatorJobResponse;
 import com.cs324a2.grpc.coordinator.JobStateProto;
@@ -108,6 +109,9 @@ public final class GrpcClientService implements AutoCloseable {
                 .setProgressIndex(job.getProgressIndex()).setStatus(job.getStatus())
                 .setJobState(job).setHasResult(job.getHasResult())
                 .setResultValue(job.getResultValue()).setError(job.getError());
+        if (!job.getExactResultValue().isEmpty()) {
+            update.setExactResultValue(job.getExactResultValue());
+        }
         perWorker.entrySet().stream().sorted(Map.Entry.comparingByKey())
                 .forEach(entry -> update.addWorkerBreakdown(WorkerProgress.newBuilder()
                         .setWorkerId(entry.getKey()).setTotalTasks(entry.getValue()[0])
@@ -120,6 +124,36 @@ public final class GrpcClientService implements AutoCloseable {
 
     /** Submits a job through gRPC, following NOT_LEADER hints. */
     public long submit(JobRequest request) throws Exception {
+        return Long.parseLong(submitExact(request));
+    }
+
+    /** Returns the exact decimal result, including sums outside signed 64-bit. */
+    public String submitExact(JobRequest request) throws Exception {
+        if (request.operation() != ComputeOperation.PRIMESUM) return submitOnce(request);
+        while (!closed && !Thread.currentThread().isInterrupted()) {
+            try {
+                return submitOnce(request);
+            } catch (StatusRuntimeException unavailable) {
+                try {
+                    JobProgressUpdate terminal = fetchJobProgress(request.jobId());
+                    if (terminal != null) {
+                        if (terminal.getStatus() == JobStatus.JOB_FAILED) {
+                            throw new JobFailedException(terminal.getError());
+                        }
+                        return terminal.getExactResultValue().isEmpty()
+                                ? Long.toString(terminal.getResultValue())
+                                : terminal.getExactResultValue();
+                    }
+                } catch (StatusRuntimeException ignored) {
+                    // Bootstrap or coordinators may still be recovering.
+                }
+                Thread.sleep(500);
+            }
+        }
+        throw new InterruptedException("PrimeSum submission stopped");
+    }
+
+    private String submitOnce(JobRequest request) throws Exception {
         if (closed) throw new IllegalStateException("client is closed");
         List<WorkerEndpoint> endpoints = ordered(listWorkers());
         if (endpoints.isEmpty()) {
@@ -127,6 +161,8 @@ public final class GrpcClientService implements AutoCloseable {
                     .withDescription("no active workers registered at bootstrap"));
         }
         JobSpec spec = CoordinatorGrpcClient.toSpec(request);
+        long submitTimeout = request.operation() == ComputeOperation.PRIMESUM
+                ? 0 : SUBMIT_TIMEOUT_MILLIS;
         StatusRuntimeException lastFailure = null;
         // First pass: try every reachable endpoint in order.
         String hintHost = null;
@@ -135,13 +171,15 @@ public final class GrpcClientService implements AutoCloseable {
             if (!CoordinatorGrpcClient.isReachable(endpoint)) continue;
             try {
                 CoordinatorJobResponse response = coordinators.submit(
-                        endpoint.getHost(), endpoint.getPort(), spec, SUBMIT_TIMEOUT_MILLIS);
+                        endpoint.getHost(), endpoint.getPort(), spec, submitTimeout);
                 if (response.getExecuted()) {
                     if (!response.getError().isEmpty()) {
                         throw new JobFailedException("job " + request.jobId()
                                 + " failed: " + response.getError());
                     }
-                    return response.getResultValue();
+                    return response.getExactResultValue().isEmpty()
+                            ? Long.toString(response.getResultValue())
+                            : response.getExactResultValue();
                 }
                 if (!response.getLeaderHost().isBlank() && response.getLeaderPort() > 0) {
                     hintHost = response.getLeaderHost();
@@ -157,13 +195,15 @@ public final class GrpcClientService implements AutoCloseable {
         if (hintHost != null) {
             try {
                 CoordinatorJobResponse response = coordinators.submit(
-                        hintHost, hintPort, spec, SUBMIT_TIMEOUT_MILLIS);
+                        hintHost, hintPort, spec, submitTimeout);
                 if (response.getExecuted()) {
                     if (!response.getError().isEmpty()) {
                         throw new JobFailedException("job " + request.jobId()
                                 + " failed: " + response.getError());
                     }
-                    return response.getResultValue();
+                    return response.getExactResultValue().isEmpty()
+                            ? Long.toString(response.getResultValue())
+                            : response.getExactResultValue();
                 }
             } catch (JobFailedException e) {
                 throw e;

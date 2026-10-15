@@ -17,15 +17,6 @@ public record JobRequest(
     @Serial
     private static final long serialVersionUID = 1L;
 
-    /**
-     * Maximum number of values ({@code end - start + 1}) accepted in a PRIMESUM
-     * range. The segmented sieve can address far larger endpoints, but spans
-     * beyond this would blow past interactive job timeouts on the demo cluster.
-     * Shared by {@link JobRequest}, the client's CSV parser, and the GUI so all
-     * range entry points reject the same oversized inputs.
-     */
-    public static final long MAX_RANGE_SPAN = 100_000_000L;
-
     public JobRequest {
         validateJobId(jobId);
         if (operation == null) {
@@ -97,24 +88,12 @@ public record JobRequest(
     }
 
     /**
-     * Shared PRIMESUM bounds check: ordering, 64-bit span overflow, and the
-     * {@link #MAX_RANGE_SPAN} cap. Throws {@link IllegalArgumentException} with
-     * a message callers can surface directly or wrap (e.g. as an
-     * {@code IOException} for CSV input).
+     * Shared PRIMESUM bounds check. Range length is calculated as a BigInteger
+     * by the partitioner, so even the full signed-long domain is representable.
      */
     public static void checkRangeSpan(long start, long end) {
         if (start > end) {
             throw new IllegalArgumentException("start must not be greater than end");
-        }
-        final long span;
-        try {
-            span = Math.addExact(Math.subtractExact(end, start), 1L);
-        } catch (ArithmeticException e) {
-            throw new IllegalArgumentException("PRIMESUM range is too wide", e);
-        }
-        if (span > MAX_RANGE_SPAN) {
-            throw new IllegalArgumentException("PRIMESUM range span " + span
-                    + " exceeds the maximum of " + MAX_RANGE_SPAN);
         }
     }
 }

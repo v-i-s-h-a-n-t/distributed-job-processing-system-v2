@@ -2,10 +2,12 @@ package com.cs324a2.compute;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertThrows;
+import static org.junit.jupiter.api.Assertions.assertTrue;
 
 import java.util.Arrays;
 import java.util.Collections;
 import java.util.List;
+import java.math.BigInteger;
 import org.junit.jupiter.api.Test;
 
 class ComputeEngineTest {
@@ -62,6 +64,21 @@ class ComputeEngineTest {
     @Test
     void primeSumRejectsReversedRange() {
         assertThrows(IllegalArgumentException.class, () -> ComputeEngine.primeSum(10, 2));
+    }
+
+    @Test
+    void primeSumSupportsLargeEndpointsAndExactResults() {
+        assertEquals(BigInteger.valueOf(2_305_843_009_213_693_951L),
+                ComputeEngine.primeSumExact(2_305_843_009_213_693_951L,
+                        2_305_843_009_213_693_951L));
+        assertEquals(BigInteger.ZERO,
+                ComputeEngine.primeSumExact(3_825_123_056_546_413_051L,
+                        3_825_123_056_546_413_051L));
+        long start = Long.MAX_VALUE - 2_000;
+        assertTrue(ComputeEngine.primeSumExact(start, Long.MAX_VALUE)
+                .compareTo(BigInteger.valueOf(Long.MAX_VALUE)) > 0);
+        assertThrows(ArithmeticException.class,
+                () -> ComputeEngine.primeSum(start, Long.MAX_VALUE));
     }
 
     @Test

@@ -50,6 +50,8 @@ message ExecuteTaskResponse {
   int32 worker_id = 5;
   Operation operation = 6;
   int64 value = 7;
+  // Decimal exact value for PRIMESUM; value remains for legacy scalar jobs.
+  string exact_value = 8;
 }
 
 message PingRequest {

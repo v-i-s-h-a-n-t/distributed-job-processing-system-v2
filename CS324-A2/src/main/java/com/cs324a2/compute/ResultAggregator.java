@@ -9,6 +9,7 @@ import java.util.HashSet;
 import java.util.List;
 import java.util.Map;
 import java.util.Set;
+import java.math.BigInteger;
 
 /**
  * Validates and combines the partial results produced for a partitioned job.
@@ -20,6 +21,13 @@ public final class ResultAggregator {
     }
 
     public static long aggregate(
+            JobRequest request,
+            List<WorkUnit> expectedWorkUnits,
+            List<WorkResult> results) {
+        return aggregateExact(request, expectedWorkUnits, results).longValueExact();
+    }
+
+    public static BigInteger aggregateExact(
             JobRequest request,
             List<WorkUnit> expectedWorkUnits,
             List<WorkResult> results) {
@@ -42,15 +50,19 @@ public final class ResultAggregator {
             if (!results.isEmpty()) {
                 throw new IllegalArgumentException("an empty PRIMECOUNT job must not have results");
             }
-            return 0L;
+            return BigInteger.ZERO;
         }
 
         Set<Integer> completedPartitions = new HashSet<>();
-        long aggregate = request.operation() == ComputeOperation.MAX ? Long.MIN_VALUE : 0L;
+        BigInteger aggregate = request.operation() == ComputeOperation.MAX
+                ? BigInteger.valueOf(Long.MIN_VALUE) : BigInteger.ZERO;
 
         for (WorkResult result : results) {
             validateResult(request, expectedByPartition, completedPartitions, result);
-            aggregate = combine(request.operation(), aggregate, result.value());
+            aggregate = switch (request.operation()) {
+                case MAX -> aggregate.max(BigInteger.valueOf(result.value()));
+                case PRIMESUM, PRIMECOUNT -> aggregate.add(result.bigValue());
+            };
         }
 
         if (completedPartitions.size() != expectedByPartition.size()) {
@@ -101,10 +113,4 @@ public final class ResultAggregator {
         }
     }
 
-    private static long combine(ComputeOperation operation, long current, long value) {
-        return switch (operation) {
-            case MAX -> Math.max(current, value);
-            case PRIMESUM, PRIMECOUNT -> Math.addExact(current, value);
-        };
-    }
 }

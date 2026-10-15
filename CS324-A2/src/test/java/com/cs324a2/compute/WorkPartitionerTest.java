@@ -94,6 +94,22 @@ class WorkPartitionerTest {
     }
 
     @Test
+    void fullLongRangeUsesBoundedInitialChunksWithoutOverflow() {
+        JobRequest request = JobRequest.primeSum("huge", Long.MIN_VALUE, Long.MAX_VALUE);
+        List<WorkUnit> units = WorkPartitioner.partition(request, 4);
+        assertEquals(4, units.size());
+        assertEquals(Long.MIN_VALUE, units.get(0).start());
+        assertEquals(Long.MIN_VALUE + WorkPartitioner.primeSumChunkSize(request.end()) - 1,
+                units.get(0).end());
+        assertEquals(Long.MAX_VALUE, WorkPartitioner.partitionEnd(request, 4, 3));
+        for (int i = 1; i < 4; i++) {
+            assertEquals(WorkPartitioner.partitionBounds(request, 4, i - 1)[1]
+                    .add(java.math.BigInteger.ONE),
+                    WorkPartitioner.partitionBounds(request, 4, i)[0]);
+        }
+    }
+
+    @Test
     void emptyPrimeCountProducesNoInvalidWorkUnit() {
         JobRequest request = JobRequest.primeCount("job", Collections.emptyList());
 

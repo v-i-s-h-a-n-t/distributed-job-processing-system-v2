@@ -68,12 +68,13 @@ public final class WorkerProtoMapper {
                 .setWorkerId(workerId)
                 .setOperation(toProto(result.operation()))
                 .setValue(result.value())
+                .setExactValue(result.exactValue())
                 .build();
     }
 
     public static WorkResult toWorkResult(ExecuteTaskResponse response) {
         return new WorkResult(response.getJobId(), response.getPartitionId(),
-                fromProto(response.getOperation()), response.getValue());
+                fromProto(response.getOperation()), response.getValue(), response.getExactValue());
     }
 
     private static void validateIdentity(ExecuteTaskRequest request) {

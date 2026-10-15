@@ -501,7 +501,11 @@ public final class CoordinatorNode implements AutoCloseable {
         try {
             long result = executeNewJob(request);
             ReplicatedJobStore.JobRecord finished = store.get(request.jobId());
-            return response.setExecuted(true).setResultValue(result).setHasResult(true)
+            var completedResponse = response.setExecuted(true).setResultValue(result).setHasResult(true);
+            if (finished != null && !finished.exactResultValue().isEmpty()) {
+                completedResponse.setExactResultValue(finished.exactResultValue());
+            }
+            return completedResponse
                     .setProgressIndex(finished == null ? store.progress()
                             : finished.progressIndex())
                     .build();
@@ -640,6 +644,24 @@ public final class CoordinatorNode implements AutoCloseable {
             }
         }
         double fraction = total == 0 ? 1.0 : completed / (double) total;
+        if (snapshot.request().operation() == ComputeOperation.PRIMESUM && total > 0) {
+            java.math.BigInteger count = java.math.BigInteger.valueOf(snapshot.request().end())
+                    .subtract(java.math.BigInteger.valueOf(snapshot.request().start()))
+                    .add(java.math.BigInteger.ONE);
+            java.math.BigInteger processed = java.math.BigInteger.ZERO;
+            for (ReplicatedJobStore.TaskRecord task : tasks) {
+                java.math.BigInteger[] bounds = WorkPartitioner.partitionBounds(
+                        snapshot.request(), total, task.unit().partitionId());
+                if (task.status() == ReplicatedJobStore.TaskState.COMPLETED) {
+                    processed = processed.add(bounds[1].subtract(bounds[0])
+                            .add(java.math.BigInteger.ONE));
+                } else {
+                    processed = processed.add(java.math.BigInteger.valueOf(task.unit().start())
+                            .subtract(bounds[0]));
+                }
+            }
+            fraction = processed.doubleValue() / count.doubleValue();
+        }
         JobStatus status = switch (snapshot.status()) {
             case COMPLETED -> JobStatus.JOB_COMPLETED;
             case FAILED -> JobStatus.JOB_FAILED;
@@ -658,6 +680,9 @@ public final class CoordinatorNode implements AutoCloseable {
                 .setJobState(CoordinatorJobMapper.toJobProto(snapshot));
         if (snapshot.resultValue() != null) {
             update.setResultValue(snapshot.resultValue()).setHasResult(true);
+        }
+        if (!snapshot.exactResultValue().isEmpty()) {
+            update.setExactResultValue(snapshot.exactResultValue()).setHasResult(true);
         }
         if (snapshot.error() != null) update.setError(snapshot.error());
         perWorker.entrySet().stream()
@@ -1390,7 +1415,8 @@ public final class CoordinatorNode implements AutoCloseable {
 
     private long awaitRunningJob(String jobId) throws JobExecutionException {
         long deadline = System.nanoTime() + config.jobTimeout().toNanos();
-        while (System.nanoTime() < deadline) {
+        boolean unbounded = store.get(jobId).request().operation() == ComputeOperation.PRIMESUM;
+        while (unbounded || System.nanoTime() < deadline) {
             ReplicatedJobStore.JobRecord record = store.get(jobId);
             if (record != null) {
                 if (record.status() == ReplicatedJobStore.JobStatus.COMPLETED) {
@@ -1442,7 +1468,8 @@ public final class CoordinatorNode implements AutoCloseable {
             reclaimStaleRunningTasks(jobId);
             while (true) {
                 ensureLeader(jobId);
-                if (System.nanoTime() >= jobDeadline) {
+                if (System.nanoTime() >= jobDeadline
+                        && store.live(jobId).request().operation() != ComputeOperation.PRIMESUM) {
                     return failJob(jobId, "job exceeded its deadline");
                 }
                 ReplicatedJobStore.JobRecord live = store.live(jobId);
@@ -1464,7 +1491,8 @@ public final class CoordinatorNode implements AutoCloseable {
                 taskClient.retainWorkers(members.version(), members.workers());
                 List<WorkerEndpoint> workers = members.workers().stream()
                         .filter(com.cs324a2.client.CoordinatorGrpcClient::isReachable)
-                        .filter(w -> dispatchFailures.getOrDefault(w.getRegistrationId(),
+                        .filter(w -> store.live(jobId).request().operation() == ComputeOperation.PRIMESUM
+                                || dispatchFailures.getOrDefault(w.getRegistrationId(),
                                 new AtomicInteger()).get() < 2)
                         .sorted(Comparator.comparingInt(WorkerEndpoint::getWorkerId))
                         .toList();
@@ -1518,7 +1546,8 @@ public final class CoordinatorNode implements AutoCloseable {
                                     task.unit(),
                                     ReplicatedJobStore.TaskState.PENDING,
                                     task.attempt(), task.assignedWorkerId(),
-                                    null, "reclaimed from dead leader", progress));
+                                    null, "reclaimed from dead leader", progress,
+                                    task.exactResultValue()));
                     live.progressIndex = progress;
                     reset = true;
                 }
@@ -1556,7 +1585,8 @@ public final class CoordinatorNode implements AutoCloseable {
                 ReplicatedJobStore.TaskRecord running =
                         new ReplicatedJobStore.TaskRecord(current.taskId(),
                                 current.unit(), ReplicatedJobStore.TaskState.RUNNING,
-                                attempt, target.getWorkerId(), null, null, progress);
+                                attempt, target.getWorkerId(), null, null, progress,
+                                current.exactResultValue());
                 live.tasks.put(current.unit().partitionId(), running);
                 live.progressIndex = progress;
                 System.out.printf("[Coordinator %d] event=ASSIGN progress=%d jobId=%s"
@@ -1663,7 +1693,9 @@ public final class CoordinatorNode implements AutoCloseable {
                 return;
             }
             if (outcome.error() != null) {
-                if (isTransportFailure(outcome.error())) {
+                if (isTransportFailure(outcome.error())
+                        && !(live.request().operation() == ComputeOperation.PRIMESUM
+                                && isTaskTimeout(outcome.error()))) {
                     dispatchFailures.computeIfAbsent(
                             outcome.dispatched().target().getRegistrationId(),
                             ignored -> new AtomicInteger()).incrementAndGet();
@@ -1672,14 +1704,34 @@ public final class CoordinatorNode implements AutoCloseable {
                 String reason = outcome.error().getMessage() == null
                         ? outcome.error().getClass().getSimpleName()
                         : outcome.error().getMessage();
-                if (current.attempt() >= config.maximumAttempts()) {
+                if (live.request().operation() == ComputeOperation.PRIMESUM
+                        && isTaskTimeout(outcome.error())
+                        && current.unit().start() < current.unit().end()) {
+                    long midpoint = java.math.BigInteger.valueOf(current.unit().start())
+                            .add(java.math.BigInteger.valueOf(current.unit().end()))
+                            .shiftRight(1).longValueExact();
+                    WorkUnit smaller = WorkUnit.primeSum(jobId,
+                            current.unit().partitionId(), current.unit().start(), midpoint);
+                    long progress = store.nextProgress();
+                    live.tasks.put(current.unit().partitionId(),
+                            new ReplicatedJobStore.TaskRecord(current.taskId(), smaller,
+                                    ReplicatedJobStore.TaskState.PENDING, 0,
+                                    current.assignedWorkerId(), null, reason, progress,
+                                    current.exactResultValue()));
+                    live.progressIndex = progress;
+                    replicate(live.snapshot());
+                    return;
+                }
+                if (current.attempt() >= config.maximumAttempts()
+                        && (live.request().operation() != ComputeOperation.PRIMESUM
+                            || !isTransportFailure(outcome.error()))) {
                     long progress = store.nextProgress();
                     live.tasks.put(current.unit().partitionId(),
                             new ReplicatedJobStore.TaskRecord(current.taskId(),
                                     current.unit(),
                                     ReplicatedJobStore.TaskState.FAILED,
                                     current.attempt(), current.assignedWorkerId(),
-                                    null, reason, progress));
+                                    null, reason, progress, current.exactResultValue()));
                     live.progressIndex = progress;
                     System.out.printf("[Coordinator %d] event=FAIL progress=%d jobId=%s"
                                     + " taskId=%s detail=%s%n",
@@ -1691,7 +1743,7 @@ public final class CoordinatorNode implements AutoCloseable {
                                     current.unit(),
                                     ReplicatedJobStore.TaskState.PENDING,
                                     current.attempt(), current.assignedWorkerId(),
-                                    null, reason, progress));
+                                    null, reason, progress, current.exactResultValue()));
                     live.progressIndex = progress;
                     System.out.printf("[Coordinator %d] event=RETRY progress=%d jobId=%s"
                                     + " taskId=%s attempt=%d detail=%s%n",
@@ -1715,7 +1767,8 @@ public final class CoordinatorNode implements AutoCloseable {
                         new ReplicatedJobStore.TaskRecord(current.taskId(),
                                 current.unit(), ReplicatedJobStore.TaskState.PENDING,
                                 current.attempt(), current.assignedWorkerId(),
-                                null, "mismatched result identity", progress));
+                                null, "mismatched result identity", progress,
+                                current.exactResultValue()));
                 live.progressIndex = progress;
                 replicate(live.snapshot());
                 return;
@@ -1729,16 +1782,45 @@ public final class CoordinatorNode implements AutoCloseable {
                         new ReplicatedJobStore.TaskRecord(current.taskId(),
                                 current.unit(), ReplicatedJobStore.TaskState.PENDING,
                                 current.attempt(), current.assignedWorkerId(),
-                                null, e.getMessage(), progress));
+                                null, e.getMessage(), progress,
+                                current.exactResultValue()));
                 live.progressIndex = progress;
                 replicate(live.snapshot());
                 return;
             }
             long progress = store.nextProgress();
-            live.tasks.put(current.unit().partitionId(),
-                    new ReplicatedJobStore.TaskRecord(current.taskId(), current.unit(),
-                            ReplicatedJobStore.TaskState.COMPLETED, current.attempt(),
-                            current.assignedWorkerId(), result.value(), null, progress));
+            if (live.request().operation() == ComputeOperation.PRIMESUM) {
+                java.math.BigInteger previous = current.exactResultValue().isEmpty()
+                        ? java.math.BigInteger.ZERO
+                        : new java.math.BigInteger(current.exactResultValue());
+                java.math.BigInteger sum = previous.add(result.bigValue());
+                long partitionEnd = WorkPartitioner.partitionEnd(live.request(),
+                        live.tasks.size(), current.unit().partitionId());
+                boolean finished = current.unit().end() == partitionEnd;
+                WorkUnit nextUnit = current.unit();
+                if (!finished) {
+                    long nextStart = current.unit().end() + 1;
+                    long nextEnd = java.math.BigInteger.valueOf(nextStart)
+                            .add(java.math.BigInteger.valueOf(
+                                    WorkPartitioner.primeSumChunkSize(live.request().end()) - 1))
+                            .min(java.math.BigInteger.valueOf(partitionEnd)).longValueExact();
+                    nextUnit = WorkUnit.primeSum(jobId, current.unit().partitionId(),
+                            nextStart, nextEnd);
+                }
+                live.tasks.put(current.unit().partitionId(),
+                        new ReplicatedJobStore.TaskRecord(current.taskId(), nextUnit,
+                                finished ? ReplicatedJobStore.TaskState.COMPLETED
+                                        : ReplicatedJobStore.TaskState.PENDING,
+                                finished ? current.attempt() : 0, current.assignedWorkerId(),
+                                finished ? (sum.bitLength() <= 63 ? sum.longValue() : 0L)
+                                        : null, null, progress,
+                                sum.toString()));
+            } else {
+                live.tasks.put(current.unit().partitionId(),
+                        new ReplicatedJobStore.TaskRecord(current.taskId(), current.unit(),
+                                ReplicatedJobStore.TaskState.COMPLETED, current.attempt(),
+                                current.assignedWorkerId(), result.value(), null, progress));
+            }
             live.progressIndex = progress;
             System.out.printf("[Coordinator %d] event=COMPLETE progress=%d jobId=%s"
                             + " taskId=%s workerId=%d value=%d%n",
@@ -1757,6 +1839,12 @@ public final class CoordinatorNode implements AutoCloseable {
         return false;
     }
 
+    private static boolean isTaskTimeout(Throwable error) {
+        return error instanceof TimeoutException
+                || error instanceof StatusRuntimeException status
+                && status.getStatus().getCode() == Status.Code.DEADLINE_EXCEEDED;
+    }
+
     private long finishJob(String jobId) throws JobExecutionException {
         ensureLeader(jobId);
         ReplicatedJobStore.JobRecord live = store.live(jobId);
@@ -1766,11 +1854,24 @@ public final class CoordinatorNode implements AutoCloseable {
             units = live.tasks().stream().map(ReplicatedJobStore.TaskRecord::unit).toList();
             results = live.tasks().stream()
                     .map(t -> new WorkResult(jobId, t.unit().partitionId(),
-                            live.request().operation(), t.resultValue()))
+                            live.request().operation(), t.resultValue(), t.exactResultValue()))
                     .toList();
         }
         long aggregate;
         try {
+            if (live.request().operation() == ComputeOperation.PRIMESUM) {
+                java.math.BigInteger exact = results.stream().map(WorkResult::bigValue)
+                        .reduce(java.math.BigInteger.ZERO, java.math.BigInteger::add);
+                synchronized (live) {
+                    long progress = store.nextProgress();
+                    live.status = ReplicatedJobStore.JobStatus.COMPLETED;
+                    live.resultValue = exact.bitLength() <= 63 ? exact.longValue() : 0L;
+                    live.exactResultValue = exact.toString();
+                    live.progressIndex = progress;
+                    replicate(live.snapshot());
+                }
+                return exact.bitLength() <= 63 ? exact.longValue() : 0L;
+            }
             aggregate = ResultAggregator.aggregate(live.request(), units, results);
         } catch (IllegalArgumentException | ArithmeticException e) {
             return failJob(jobId, "aggregation failed: " + e.getMessage());
