@@ -513,6 +513,14 @@ public final class CoordinatorNode implements AutoCloseable {
             return response.setExecuted(false).build();
         } catch (JobExecutionException e) {
             ReplicatedJobStore.JobRecord failed = store.get(request.jobId());
+            // A coordinator may shut down after accepting the RPC. Its local
+            // dispatch abort is not a job failure: the replicated checkpoint
+            // remains active and the replacement leader can finish it.
+            if ((closed.get() || !isLeader())
+                    && failed != null
+                    && failed.status() != ReplicatedJobStore.JobStatus.FAILED) {
+                return response.setExecuted(false).build();
+            }
             var builder = response.setExecuted(true)
                     .setError(e.getMessage() == null ? "job failed" : e.getMessage());
             if (failed != null) builder.setProgressIndex(failed.progressIndex());

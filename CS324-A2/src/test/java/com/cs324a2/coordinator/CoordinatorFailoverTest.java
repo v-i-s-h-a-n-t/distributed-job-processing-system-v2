@@ -1,6 +1,7 @@
 package com.cs324a2.coordinator;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
+import static org.junit.jupiter.api.Assertions.assertFalse;
 import static org.junit.jupiter.api.Assertions.assertNotEquals;
 import static org.junit.jupiter.api.Assertions.assertNotNull;
 import static org.junit.jupiter.api.Assertions.assertTrue;
@@ -94,13 +95,8 @@ class CoordinatorFailoverTest {
 
         // 2. Submit a job that blocks on partition 0 so the kill lands mid-job.
         JobRequest job = JobRequest.max("failover-job", List.of(3, 7, 1, 9, 2, 8));
-        CompletableFuture<Long> doomed = CompletableFuture.supplyAsync(() -> {
-            try {
-                return leader.submitJob(job);
-            } catch (JobExecutionException e) {
-                throw new RuntimeException(e);
-            }
-        }, clients);
+        var doomed = CompletableFuture.supplyAsync(() ->
+                leader.handleSubmit(CoordinatorJobMapper.toSpec(job)), clients);
 
         awaitCondition(() -> leader.job("failover-job") != null, 10_000,
                 "leader admits failover-job");
@@ -120,18 +116,14 @@ class CoordinatorFailoverTest {
         long termAtKill = leader.getCurrentTerm();
         int deadId = leader.workerId();
 
-        // 4. Kill the coordinator mid-job; its in-flight submission must abort.
+        // 4. Kill the coordinator mid-job; the old RPC must tell the client
+        // to retry rather than report a permanent job failure.
         leader.close();
         rpc.markDead(deadId);
         System.out.printf("[Failover] killed coordinator %d during job %s%n",
                 deadId, job.jobId());
-        try {
-            doomed.get(10, TimeUnit.SECONDS);
-            fail("the killed leader's submission should not complete");
-        } catch (Exception expected) {
-            System.out.println("[Failover] killed leader abandoned job: "
-                    + expected.getCause());
-        }
+        assertFalse(doomed.get(10, TimeUnit.SECONDS).getExecuted(),
+                "a shutdown coordinator must return a retryable response");
 
         // 5. A replacement is elected with a higher term; only one leader remains.
         List<CoordinatorNode> survivors = followersOf(
