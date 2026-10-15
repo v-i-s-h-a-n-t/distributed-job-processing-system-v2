@@ -91,6 +91,9 @@ Set Host and Port in the CONNECTION section. Defaults are `localhost` and
 
 Operations are `MAX`, `PRIMECOUNT`, and `PRIMESUM`. Enter values directly or use
 Load CSV. Multiple jobs run at once.
+Number-list CSVs such as `data/numbers-xl.csv` are for `MAX` or `PRIMECOUNT`;
+if one is loaded while `PRIMESUM` is selected, the GUI offers those two
+operations. A `PRIMESUM` CSV contains one `start,end` row.
 
 ### Progress
 

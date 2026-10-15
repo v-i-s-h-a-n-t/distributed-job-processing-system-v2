@@ -667,9 +667,27 @@ public class ClientApp extends JFrame {
         File file = chooser.getSelectedFile();
         try {
             if (operationBox.getSelectedItem() == ComputeOperation.PRIMESUM) {
-                long[] range = JobParser.loadPrimeSumRange(file);
-                startField.setValue(range[0]);
-                endField.setValue(range[1]);
+                try {
+                    long[] range = JobParser.loadPrimeSumRange(file);
+                    startField.setValue(range[0]);
+                    endField.setValue(range[1]);
+                } catch (java.io.IOException rangeError) {
+                    List<Integer> numbers;
+                    try {
+                        numbers = JobParser.loadNumberList(file);
+                    } catch (java.io.IOException listError) {
+                        throw rangeError;
+                    }
+                    Object[] choices = {ComputeOperation.MAX, ComputeOperation.PRIMECOUNT,
+                            "Cancel"};
+                    int choice = JOptionPane.showOptionDialog(this,
+                            file.getName() + " contains a list of numbers. Choose an operation:",
+                            "Load number list", JOptionPane.DEFAULT_OPTION,
+                            JOptionPane.QUESTION_MESSAGE, null, choices, choices[0]);
+                    if (choice < 0 || choice == 2) return;
+                    operationBox.setSelectedItem(choices[choice]);
+                    numbersArea.setText(numbers.toString().replaceAll("[\\[\\]]", ""));
+                }
             } else {
                 List<Integer> numbers = JobParser.loadNumberList(file);
                 numbersArea.setText(numbers.toString().replaceAll("[\\[\\]]", ""));
