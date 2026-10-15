@@ -180,7 +180,7 @@ public final class GrpcClientService implements AutoCloseable {
      * Streams real-time progress for {@code jobId}. The subscription survives
      * coordinator failover by roaming across endpoints: followers serve their
      * replicated snapshot, so killing the leader mid-job does not end the
-     * stream. Updates stop on terminal state, error (all endpoints dead), or
+     * stream. Updates stop on terminal state or
      * {@link ProgressHandle#cancel()}.
      */
     public ProgressHandle subscribeProgress(String jobId, ProgressListener listener) {
@@ -207,94 +207,43 @@ public final class GrpcClientService implements AutoCloseable {
 
     private void streamLoop(String jobId, ProgressListener listener,
                             CoordinatorGrpcClient streamClient, AtomicBoolean cancelled) {
-        List<WorkerEndpoint> endpoints;
-        try {
-            endpoints = ordered(listWorkers());
-        } catch (RuntimeException e) {
-            if (!cancelled.get()) listener.onError(e);
-            closeQuietly(streamClient);
-            return;
-        }
-        if (endpoints.isEmpty()) {
-            listener.onError(Status.UNAVAILABLE
-                    .withDescription("no active workers for progress stream").asRuntimeException());
-            closeQuietly(streamClient);
-            return;
-        }
-        // Roam across endpoints until a terminal update, cancellation, or
-        // every endpoint fails consecutively without any update.
-        int consecutiveFailures = 0;
         int index = 0;
-        // The stream owns a separate CoordinatorGrpcClient from the submit
-        // channel. Closing this facade after SubmitJob returns must not stop
-        // progress delivery; the per-job ProgressHandle controls its lifetime.
-        while (!cancelled.get()) {
-            WorkerEndpoint endpoint = endpoints.get(index % endpoints.size());
-            index++;
-            if (!CoordinatorGrpcClient.isReachable(endpoint)) {
-                consecutiveFailures++;
-                if (consecutiveFailures >= endpoints.size()) break;
-                continue;
-            }
-            try {
-                Iterator<JobProgressUpdate> stream =
-                        streamClient.subscribeBlocking(
-                                endpoint.getHost(), endpoint.getPort(), jobId);
-                consecutiveFailures = 0;
-                while (!cancelled.get() && stream.hasNext()) {
-                    JobProgressUpdate update = stream.next();
-                    listener.onUpdate(update);
-                    if (update.getStatus() != JobStatus.JOB_ACTIVE) {
-                        listener.onCompleted();
-                        closeQuietly(streamClient);
-                        return;
-                    }
-                }
-                // Server completed without a terminal update (should not
-                // happen); treat as terminal to avoid spinning.
-                if (!cancelled.get()) {
-                    listener.onCompleted();
-                    closeQuietly(streamClient);
-                    return;
-                }
-            } catch (StatusRuntimeException e) {
-                if (cancelled.get()
-                        || e.getStatus().getCode() == Status.Code.CANCELLED) {
-                    closeQuietly(streamClient);
-                    return;
-                }
-                consecutiveFailures++;
-                if (consecutiveFailures >= Math.max(1, endpoints.size())) {
-                    // Refresh membership once before giving up (covers the
-                    // post-failover replacement joining under a new port).
-                    try {
-                        List<WorkerEndpoint> fresh = ordered(listWorkers());
-                        if (!fresh.isEmpty()) {
-                            endpoints = fresh;
-                            consecutiveFailures = 0;
-                            continue;
-                        }
-                    } catch (RuntimeException ignored) {
-                        // Fall through to the error below.
-                    }
-                    listener.onError(e);
-                    closeQuietly(streamClient);
-                    return;
-                }
+        try {
+            while (!cancelled.get()) {
+                List<WorkerEndpoint> endpoints;
                 try {
-                    Thread.sleep(200);
-                } catch (InterruptedException ie) {
-                    Thread.currentThread().interrupt();
-                    closeQuietly(streamClient);
-                    return;
+                    endpoints = ordered(listWorkers());
+                } catch (RuntimeException unavailable) {
+                    endpoints = List.of();
                 }
-            } catch (RuntimeException e) {
-                if (!cancelled.get()) listener.onError(e);
-                closeQuietly(streamClient);
-                return;
+                if (!endpoints.isEmpty()) {
+                    WorkerEndpoint endpoint = endpoints.get(index++ % endpoints.size());
+                    if (CoordinatorGrpcClient.isReachable(endpoint)) {
+                        try {
+                            Iterator<JobProgressUpdate> stream = streamClient.subscribeBlocking(
+                                    endpoint.getHost(), endpoint.getPort(), jobId);
+                            while (!cancelled.get() && stream.hasNext()) {
+                                JobProgressUpdate update = stream.next();
+                                listener.onUpdate(update);
+                                if (update.getStatus() != JobStatus.JOB_ACTIVE) {
+                                    listener.onCompleted();
+                                    return;
+                                }
+                            }
+                        } catch (StatusRuntimeException unavailable) {
+                            if (cancelled.get()) return;
+                        } catch (RuntimeException unavailable) {
+                            if (cancelled.get()) return;
+                        }
+                    }
+                }
+                Thread.sleep(200);
             }
+        } catch (InterruptedException interrupted) {
+            Thread.currentThread().interrupt();
+        } finally {
+            closeQuietly(streamClient);
         }
-        closeQuietly(streamClient);
     }
 
     private static List<WorkerEndpoint> ordered(List<WorkerEndpoint> endpoints) {

@@ -61,7 +61,7 @@ its reachable IP address.
 `DeregisterWorker`, `ListWorkers` (= suggested `GetActiveWorkers`),
 `GetRandomWorker` (uniform draw for unstructured joins), and the
 `WatchMembership` stream. Workers heartbeat every 2 seconds and are dropped
-after 8 seconds of silence.
+after 8 seconds of silence or 2 consecutive reported task transport failures.
 
 `worker.proto` exposes `ExecuteTask`, which runs one partition, plus `Ping`
 (liveness probe, suggested `Heartbeat`/`Ping`).
@@ -120,11 +120,13 @@ The sieve handles endpoints up to 2,500,000,000,000,000. Sums that overflow a
 
 ### Workers
 
-Bootstrap drops a worker after 8 seconds without a heartbeat and broadcasts the
-removal. Each coordinator node also watches the membership stream and prunes
+Bootstrap drops a worker after 8 seconds without a heartbeat or 2 consecutive
+task transport failures for that registration, and broadcasts the removal.
+Each coordinator node also watches the membership stream and prunes
 departed workers from its neighbour list, and drops a neighbour after 3
 consecutive election/heartbeat RPC failures — so floods stop dialling dead
-peers while the job continues. Failed tasks are retried elsewhere up to
+peers while the job continues. A retry avoids its previous worker when another
+worker is available. Failed tasks are retried up to
 `SchedulerConfig.maximumAttempts`. Work left RUNNING by a dead worker returns to
 PENDING and is reassigned. New workers can join mid-job (register + link to a
 random active worker).
@@ -148,11 +150,13 @@ Election is the Assignment-1 unstructured JAC flood over gRPC:
   `ELECTION` message floods neighbours-except-sender, duplicates are ignored
   via `seenElectionIds`, and each subtree convergecasts its best candidate, so
   all reachable active workers are considered.
-- Winner = lowest Job Allocation Counter (JAC); ties break to the highest
+- Winner = highest replicated progress; among equally current replicas, the
+  lowest Job Allocation Counter (JAC) wins, with ties going to the highest
   worker ID.
 - The winner is announced with a `COORDINATOR` flood (`seenCoordinatorIds`
   dedup) so every reachable worker installs the same leader; stale terms are
-  rejected and same-term conflicts merge deterministically to the better JAC
+  rejected and same-term conflicts merge deterministically to the more current
+  replica, then the better JAC
   candidate, giving one coordinator per term.
 - One term serves at most 5 jobs (`MAX_JOBS_PER_TERM`): admissions increment
   JAC + term count; the 5th admission closes the term; once in-flight jobs
@@ -168,7 +172,8 @@ Election is the Assignment-1 unstructured JAC flood over gRPC:
 - Split-brain protection: monotonic terms, only the first/best leader per term
   is recognised, job admission needs a majority heartbeat lease, leaders
   recheck leadership mid-job and abort on loss.
-- A new leader restores those snapshots, reclaims RUNNING tasks, keeps COMPLETED
+- A new leader pulls available peer snapshots before serving, reclaims RUNNING
+  tasks, keeps COMPLETED
   results, and resumes unfinished jobs without client help.
 
 Demo: submit a wide PRIMESUM and kill the leader mid-job. The survivors elect a

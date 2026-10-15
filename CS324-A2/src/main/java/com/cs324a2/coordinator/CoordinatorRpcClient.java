@@ -4,6 +4,8 @@ import com.cs324a2.grpc.coordinator.CoordinatorAck;
 import com.cs324a2.grpc.coordinator.CoordinatorAnnounce;
 import com.cs324a2.grpc.coordinator.CoordinatorJobRequest;
 import com.cs324a2.grpc.coordinator.CoordinatorJobResponse;
+import com.cs324a2.grpc.coordinator.GetCoordinatorStateRequest;
+import com.cs324a2.grpc.coordinator.GetCoordinatorStateResponse;
 import com.cs324a2.grpc.coordinator.CoordinatorServiceGrpc;
 import com.cs324a2.grpc.coordinator.ElectionRequest;
 import com.cs324a2.grpc.coordinator.ElectionResponse;
@@ -61,6 +63,11 @@ final class CoordinatorRpcClient implements AutoCloseable {
                                   long timeoutMillis) {
         return stubFor(host, port).withDeadlineAfter(timeoutMillis, TimeUnit.MILLISECONDS)
                 .submitJob(request);
+    }
+
+    GetCoordinatorStateResponse getState(String host, int port, long timeoutMillis) {
+        return stubFor(host, port).withDeadlineAfter(timeoutMillis, TimeUnit.MILLISECONDS)
+                .getCoordinatorState(GetCoordinatorStateRequest.getDefaultInstance());
     }
 
     NeighborResponse addNeighbor(String host, int port, NeighborRequest request,

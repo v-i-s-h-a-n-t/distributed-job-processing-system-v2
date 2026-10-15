@@ -74,6 +74,21 @@ class BootstrapGrpcServiceTest {
     }
 
     @Test
+    void twoTransportFailuresPruneOnlyTheMatchingRegistration() {
+        BootstrapClient.Registration registration = client.register(8, "localhost", 51008);
+        var endpoint = client.listWorkers().activeWorkers().get(0);
+        var stale = endpoint.toBuilder().setRegistrationId("stale").build();
+        assertFalse(client.reportWorkerRpcResult(stale, false));
+        assertFalse(client.reportWorkerRpcResult(endpoint, false));
+        assertEquals(1, client.listWorkers().activeWorkers().size());
+        client.reportWorkerRpcResult(endpoint, true);
+        assertFalse(client.reportWorkerRpcResult(endpoint, false));
+        assertTrue(client.reportWorkerRpcResult(endpoint, false));
+        assertTrue(client.listWorkers().activeWorkers().isEmpty());
+        assertFalse(client.heartbeat(8, registration.registrationId()));
+    }
+
+    @Test
     void watchSendsSnapshotThenJoinAndLeaveEvents() throws Exception {
         BootstrapClient.Registration first = client.register(3, "localhost", 51003);
         BlockingQueue<MembershipEvent> events = new LinkedBlockingQueue<>();

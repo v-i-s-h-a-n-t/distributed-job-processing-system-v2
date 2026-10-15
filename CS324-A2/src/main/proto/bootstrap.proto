@@ -37,6 +37,21 @@ service BootstrapService {
   // Alias for ListWorkers (suggested §5 GetActiveWorkers).
   rpc GetActiveWorkers(ListWorkersRequest)
       returns (ListWorkersResponse);
+
+  // Reports a task RPC result for the exact registered process. Two
+  // consecutive transport failures remove it before heartbeat expiry.
+  rpc ReportWorkerRpcResult(WorkerRpcResultRequest)
+      returns (WorkerRpcResultResponse);
+}
+
+message WorkerRpcResultRequest {
+  int32 worker_id = 1;
+  string registration_id = 2;
+  bool success = 3;
+}
+
+message WorkerRpcResultResponse {
+  bool removed = 1;
 }
 
 // Network address and registration identity for a worker process.

@@ -7,6 +7,7 @@ import com.cs324a2.grpc.bootstrap.HeartbeatRequest;
 import com.cs324a2.grpc.bootstrap.ListWorkersRequest;
 import com.cs324a2.grpc.bootstrap.MembershipEvent;
 import com.cs324a2.grpc.bootstrap.RegisterWorkerRequest;
+import com.cs324a2.grpc.bootstrap.WorkerRpcResultRequest;
 import com.cs324a2.grpc.bootstrap.WatchMembershipRequest;
 import com.cs324a2.grpc.bootstrap.WorkerEndpoint;
 import io.grpc.ManagedChannel;
@@ -81,6 +82,14 @@ public final class BootstrapClient implements AutoCloseable {
                         .setRegistrationId(registrationId)
                         .build())
                 .getRemoved();
+    }
+
+    public boolean reportWorkerRpcResult(WorkerEndpoint endpoint, boolean success) {
+        return blockingStub.withDeadlineAfter(1, TimeUnit.SECONDS)
+                .reportWorkerRpcResult(WorkerRpcResultRequest.newBuilder()
+                        .setWorkerId(endpoint.getWorkerId())
+                        .setRegistrationId(endpoint.getRegistrationId())
+                        .setSuccess(success).build()).getRemoved();
     }
 
     public WorkerSnapshot listWorkers() {

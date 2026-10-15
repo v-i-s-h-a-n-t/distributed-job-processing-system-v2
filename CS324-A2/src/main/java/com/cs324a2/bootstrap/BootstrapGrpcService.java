@@ -14,6 +14,8 @@ import com.cs324a2.grpc.bootstrap.RegisterWorkerRequest;
 import com.cs324a2.grpc.bootstrap.RegisterWorkerResponse;
 import com.cs324a2.grpc.bootstrap.WatchMembershipRequest;
 import com.cs324a2.grpc.bootstrap.WorkerEndpoint;
+import com.cs324a2.grpc.bootstrap.WorkerRpcResultRequest;
+import com.cs324a2.grpc.bootstrap.WorkerRpcResultResponse;
 import io.grpc.Status;
 import io.grpc.stub.ServerCallStreamObserver;
 import io.grpc.stub.StreamObserver;
@@ -41,6 +43,7 @@ public final class BootstrapGrpcService
 
     private final Object membershipLock = new Object();
     private final Map<Integer, WorkerRegistration> workers = new HashMap<>();
+    private final Map<Integer, Integer> rpcFailures = new HashMap<>();
     private final List<MembershipSubscriber> subscribers = new CopyOnWriteArrayList<>();
     private final long heartbeatTimeoutNanos;
     private final ScheduledExecutorService expiryScheduler;
@@ -107,6 +110,7 @@ public final class BootstrapGrpcService
                     .setRegistrationId(UUID.randomUUID().toString())
                     .build();
             workers.put(workerId, new WorkerRegistration(endpoint, System.nanoTime()));
+            rpcFailures.remove(workerId);
 
             long version = ++membershipVersion;
             publishLocked(MembershipEvent.newBuilder()
@@ -165,6 +169,7 @@ public final class BootstrapGrpcService
                             .equals(request.getRegistrationId())
                     && workers.remove(request.getWorkerId(), registration)) {
                 removed = true;
+                rpcFailures.remove(request.getWorkerId());
                 publishWorkerLeftLocked(registration.endpoint());
             }
         }
@@ -173,6 +178,30 @@ public final class BootstrapGrpcService
                 .setRemoved(removed)
                 .build());
         responseObserver.onCompleted();
+    }
+
+    @Override
+    public void reportWorkerRpcResult(WorkerRpcResultRequest request,
+                                      StreamObserver<WorkerRpcResultResponse> observer) {
+        boolean removed = false;
+        synchronized (membershipLock) {
+            WorkerRegistration registration = workers.get(request.getWorkerId());
+            if (registration != null && registration.endpoint().getRegistrationId()
+                    .equals(request.getRegistrationId())) {
+                if (request.getSuccess()) {
+                    rpcFailures.remove(request.getWorkerId());
+                } else {
+                    int failures = rpcFailures.merge(request.getWorkerId(), 1, Integer::sum);
+                    if (failures >= 2 && workers.remove(request.getWorkerId(), registration)) {
+                        rpcFailures.remove(request.getWorkerId());
+                        publishWorkerLeftLocked(registration.endpoint());
+                        removed = true;
+                    }
+                }
+            }
+        }
+        observer.onNext(WorkerRpcResultResponse.newBuilder().setRemoved(removed).build());
+        observer.onCompleted();
     }
 
     @Override
@@ -285,6 +314,7 @@ public final class BootstrapGrpcService
                 return false;
             }
             publishWorkerLeftLocked(registration.endpoint());
+            rpcFailures.remove(entry.getKey());
             System.out.printf("Bootstrap expired worker %d after missed heartbeats%n",
                     entry.getKey());
             return true;

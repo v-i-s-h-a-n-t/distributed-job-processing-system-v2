@@ -118,7 +118,9 @@ public final class CoordinatorNode implements AutoCloseable {
     private Integer leaderId;
     /** JAC of the recognised leader; used for deterministic same-term merges. */
     private int leaderJac = Integer.MAX_VALUE;
+    private long leaderProgressIndex;
     private boolean isLeader;
+    private volatile boolean leaderReady = true;
     private volatile long lastHeartbeatNanos = System.nanoTime();
     private final long electionTimeoutMillis =
             ELECTION_TIMEOUT_BASE_MILLIS
@@ -153,6 +155,8 @@ public final class CoordinatorNode implements AutoCloseable {
     private final ScheduledExecutorService timers;
     private final ExecutorService jobs;
     private final AtomicInteger workerCursor = new AtomicInteger();
+    private final ConcurrentHashMap<String, AtomicInteger> dispatchFailures =
+            new ConcurrentHashMap<>();
     private final ConcurrentHashMap<String, Boolean> runningJobs = new ConcurrentHashMap<>();
     private final AtomicLong electionCount = new AtomicLong();
 
@@ -319,6 +323,8 @@ public final class CoordinatorNode implements AutoCloseable {
                 return executeNewJob(request);
             }
         }
+        awaitLocalLeaderReady();
+        if (isLeader()) return executeNewJob(request);
         LeaderHint hint = leaderHint();
         if (hint != null && hint.workerId() != workerId) {
             try {
@@ -441,7 +447,9 @@ public final class CoordinatorNode implements AutoCloseable {
             }
             leaderJac = heartbeatLeaderJac;
             lastHeartbeatNanos = System.nanoTime();
-            store.observeProgress(commitProgress);
+            // Heartbeat progress is a hint, not a replicated checkpoint.
+            // Advancing the local watermark here could let an empty replica
+            // appear up to date in a subsequent election.
             return new HeartbeatOutcome(currentTerm, true);
         }
     }
@@ -473,6 +481,7 @@ public final class CoordinatorNode implements AutoCloseable {
         if (!isLeader() && !hasLiveLeader()) {
             initiateElection();
         }
+        awaitLocalLeaderReady();
         CoordinatorJobResponse.Builder response = CoordinatorJobResponse.newBuilder()
                 .setTerm(getCurrentTerm());
         LeaderHint hint = leaderHint();
@@ -813,6 +822,12 @@ public final class CoordinatorNode implements AutoCloseable {
         return idA > idB;
     }
 
+    static boolean isBetterCandidate(int idA, int jacA, long progressA,
+                                     int idB, int jacB, long progressB) {
+        if (progressA != progressB) return progressA > progressB;
+        return isBetterCandidate(idA, jacA, idB, jacB);
+    }
+
     public int getJAC() {
         return jac.get();
     }
@@ -941,6 +956,7 @@ public final class CoordinatorNode implements AutoCloseable {
                 workerId, electionId, request.getSenderId(), jac.get());
         int bestId = workerId;
         int bestJac = jac.get();
+        long bestProgress = store.progress();
         String bestHost = host;
         int bestPort = port;
         for (WorkerEndpoint peer : floodPeersExcluding(request.getSenderId())) {
@@ -953,9 +969,10 @@ public final class CoordinatorNode implements AutoCloseable {
                 recordNeighborSuccess(peer.getWorkerId());
                 if (child.getDuplicate()) continue;
                 if (isBetterCandidate(child.getBestWorkerId(), child.getBestJac(),
-                        bestId, bestJac)) {
+                        child.getBestProgressIndex(), bestId, bestJac, bestProgress)) {
                     bestId = child.getBestWorkerId();
                     bestJac = child.getBestJac();
+                    bestProgress = child.getBestProgressIndex();
                     bestHost = child.getBestHost();
                     bestPort = child.getBestPort();
                 }
@@ -970,6 +987,7 @@ public final class CoordinatorNode implements AutoCloseable {
         return com.cs324a2.grpc.coordinator.ElectionResponse.newBuilder()
                 .setDuplicate(false).setBestWorkerId(bestId).setBestJac(bestJac)
                 .setBestHost(bestHost).setBestPort(bestPort)
+                .setBestProgressIndex(bestProgress)
                 .setTerm(getCurrentTerm()).build();
     }
 
@@ -995,7 +1013,8 @@ public final class CoordinatorNode implements AutoCloseable {
             if (request.getTerm() == currentTerm && leaderId != null
                     && !leaderId.equals(request.getCoordinatorId())
                     && !isBetterCandidate(request.getCoordinatorId(),
-                            request.getCoordinatorJac(), leaderId, leaderJac)) {
+                            request.getCoordinatorJac(), request.getCoordinatorProgressIndex(),
+                            leaderId, leaderJac, leaderProgressIndex)) {
                 // Keep the better same-term leader, but still forward the
                 // announcement so the flood reaches the whole overlay.
                 System.out.printf("[Coordinator %d] COORDINATOR %s keeps %d over %d (same term %d)%n",
@@ -1009,7 +1028,8 @@ public final class CoordinatorNode implements AutoCloseable {
                         request.getTerm(), request.getSenderId());
                 installCoordinatorStateLocked(request.getCoordinatorId(),
                         request.getCoordinatorHost(), request.getCoordinatorPort(),
-                        request.getTerm(), request.getCoordinatorJac());
+                        request.getTerm(), request.getCoordinatorJac(),
+                        request.getCoordinatorProgressIndex());
                 if (request.getCoordinatorId() != workerId) {
                     System.out.printf("[Coordinator %d] recognizes worker %d as coordinator"
                                     + " for term %d (this node is a follower)%n",
@@ -1038,18 +1058,19 @@ public final class CoordinatorNode implements AutoCloseable {
     private void installCoordinatorState(int electedId, String electedHost,
                                          int electedPort, long term) {
         installCoordinatorStateUnsync(electedId, electedHost, electedPort, term,
-                Integer.MAX_VALUE);
+                Integer.MAX_VALUE, store.progress());
     }
 
     private void installCoordinatorState(int electedId, String electedHost,
                                          int electedPort, long term, int electedJac) {
         installCoordinatorStateUnsync(electedId, electedHost, electedPort,
-                term, electedJac);
+                term, electedJac, store.progress());
     }
 
     /** Caller must hold {@code stateLock} when calling the locked variant. */
     private void installCoordinatorStateLocked(int electedId, String electedHost,
-                                               int electedPort, long term, int electedJac) {
+                                               int electedPort, long term, int electedJac,
+                                               long electedProgress) {
         boolean was = isLeader;
         if (term > currentTerm) {
             currentTerm = term;
@@ -1057,7 +1078,9 @@ public final class CoordinatorNode implements AutoCloseable {
         }
         leaderId = electedId;
         leaderJac = electedJac;
+        leaderProgressIndex = electedProgress;
         isLeader = (electedId == workerId);
+        leaderReady = !isLeader || (was && leaderReady);
         lastHeartbeatNanos = System.nanoTime();
         boolean became = isLeader && !was;
         synchronized (termStateLock) {
@@ -1092,9 +1115,13 @@ public final class CoordinatorNode implements AutoCloseable {
                     } catch (RuntimeException ignored) {
                         // Best effort; the timer repeats heartbeats.
                     }
-                    if (becameCopy) {
+                    if (leaderCopy) {
                         try {
-                            recoverUnfinishedJobs();
+                            pullCoordinatorState();
+                            synchronized (stateLock) {
+                                if (isLeader && currentTerm == term) leaderReady = true;
+                            }
+                            if (becameCopy && isLeader()) recoverUnfinishedJobs();
                         } catch (RuntimeException ignored) {
                             // Best effort recovery; jobs retry on demand.
                         }
@@ -1106,11 +1133,27 @@ public final class CoordinatorNode implements AutoCloseable {
         }
     }
 
+    private void pullCoordinatorState() {
+        for (WorkerEndpoint peer : membership.snapshot().workers()) {
+            if (peer.getWorkerId() == workerId) continue;
+            try {
+                GetCoordinatorStateResponse state = coordClient.getState(
+                        peer.getHost(), peer.getPort(), RPC_TIMEOUT_MILLIS);
+                for (JobStateProto job : state.getJobsList()) {
+                    store.applyReplicated(job, job.getProgressIndex());
+                }
+            } catch (RuntimeException ignored) {
+                // A reachable replica is enough; unavailable peers can rejoin later.
+            }
+        }
+    }
+
     private void installCoordinatorStateUnsync(int electedId, String electedHost,
-                                               int electedPort, long term, int electedJac) {
+                                               int electedPort, long term, int electedJac,
+                                               long electedProgress) {
         synchronized (stateLock) {
             installCoordinatorStateLocked(electedId, electedHost, electedPort,
-                    term, electedJac);
+                    term, electedJac, electedProgress);
         }
     }
 
@@ -1152,6 +1195,7 @@ public final class CoordinatorNode implements AutoCloseable {
 
             int bestId = workerId;
             int bestJac = jac.get();
+            long bestProgress = store.progress();
             String bestHost = host;
             int bestPort = port;
             for (WorkerEndpoint peer : floodPeersExcluding(-1)) {
@@ -1164,9 +1208,10 @@ public final class CoordinatorNode implements AutoCloseable {
                     recordNeighborSuccess(peer.getWorkerId());
                     if (child.getDuplicate()) continue;
                     if (isBetterCandidate(child.getBestWorkerId(), child.getBestJac(),
-                            bestId, bestJac)) {
+                            child.getBestProgressIndex(), bestId, bestJac, bestProgress)) {
                         bestId = child.getBestWorkerId();
                         bestJac = child.getBestJac();
+                        bestProgress = child.getBestProgressIndex();
                         bestHost = child.getBestHost();
                         bestPort = child.getBestPort();
                     }
@@ -1187,14 +1232,16 @@ public final class CoordinatorNode implements AutoCloseable {
             System.out.printf("[Coordinator %d] ELECTION %s complete: elected worker %d"
                             + " as coordinator (JAC=%d) for term %d — flooding COORDINATOR%n",
                     workerId, electionId, bestId, bestJac, term);
-            installCoordinatorState(bestId, bestHost, bestPort, term, bestJac);
+            installCoordinatorStateUnsync(bestId, bestHost, bestPort, term,
+                    bestJac, bestProgress);
 
             String coordMsgId = "COORDINATOR-" + electionId;
             seenCoordinatorIds.add(coordMsgId);
             var announce = com.cs324a2.grpc.coordinator.CoordinatorAnnounce.newBuilder()
                     .setCoordinatorMessageId(coordMsgId).setCoordinatorId(bestId)
                     .setCoordinatorHost(bestHost).setCoordinatorPort(bestPort)
-                    .setCoordinatorJac(bestJac).setTerm(term)
+                    .setCoordinatorJac(bestJac).setCoordinatorProgressIndex(bestProgress)
+                    .setTerm(term)
                     .setSenderId(workerId).setSenderHost(host).setSenderPort(port).build();
             for (WorkerEndpoint peer : floodPeersExcluding(-1)) {
                 try {
@@ -1416,6 +1463,9 @@ public final class CoordinatorNode implements AutoCloseable {
                 WorkerMembership.Snapshot members = membership.snapshot();
                 taskClient.retainWorkers(members.version(), members.workers());
                 List<WorkerEndpoint> workers = members.workers().stream()
+                        .filter(com.cs324a2.client.CoordinatorGrpcClient::isReachable)
+                        .filter(w -> dispatchFailures.getOrDefault(w.getRegistrationId(),
+                                new AtomicInteger()).get() < 2)
                         .sorted(Comparator.comparingInt(WorkerEndpoint::getWorkerId))
                         .toList();
                 if (workers.isEmpty()) {
@@ -1493,8 +1543,14 @@ public final class CoordinatorNode implements AutoCloseable {
                         live.tasks.get(task.unit().partitionId());
                 if (current == null
                         || current.status() != ReplicatedJobStore.TaskState.PENDING) continue;
-                WorkerEndpoint target = workers.get(Math.floorMod(
-                        workerCursor.getAndIncrement(), workers.size()));
+                List<WorkerEndpoint> candidates = workers;
+                if (current.attempt() > 0 && workers.size() > 1) {
+                    candidates = workers.stream()
+                            .filter(w -> w.getWorkerId() != current.assignedWorkerId())
+                            .toList();
+                }
+                WorkerEndpoint target = candidates.get(Math.floorMod(
+                        workerCursor.getAndIncrement(), candidates.size()));
                 int attempt = current.attempt() + 1;
                 long progress = store.nextProgress();
                 ReplicatedJobStore.TaskRecord running =
@@ -1607,6 +1663,12 @@ public final class CoordinatorNode implements AutoCloseable {
                 return;
             }
             if (outcome.error() != null) {
+                if (isTransportFailure(outcome.error())) {
+                    dispatchFailures.computeIfAbsent(
+                            outcome.dispatched().target().getRegistrationId(),
+                            ignored -> new AtomicInteger()).incrementAndGet();
+                    membership.reportRpcResult(outcome.dispatched().target(), false);
+                }
                 String reason = outcome.error().getMessage() == null
                         ? outcome.error().getClass().getSimpleName()
                         : outcome.error().getMessage();
@@ -1640,6 +1702,8 @@ public final class CoordinatorNode implements AutoCloseable {
                 return;
             }
             var response = outcome.response();
+            dispatchFailures.remove(outcome.dispatched().target().getRegistrationId());
+            membership.reportRpcResult(outcome.dispatched().target(), true);
             boolean identity = response.getTaskId().equals(current.taskId())
                     && response.getJobId().equals(jobId)
                     && response.getPartitionId() == current.unit().partitionId()
@@ -1682,6 +1746,15 @@ public final class CoordinatorNode implements AutoCloseable {
                     current.assignedWorkerId(), result.value());
             replicate(live.snapshot());
         }
+    }
+
+    private static boolean isTransportFailure(Throwable error) {
+        if (error instanceof TimeoutException) return true;
+        if (error instanceof StatusRuntimeException status) {
+            return status.getStatus().getCode() == Status.Code.UNAVAILABLE
+                    || status.getStatus().getCode() == Status.Code.DEADLINE_EXCEEDED;
+        }
+        return false;
     }
 
     private long finishJob(String jobId) throws JobExecutionException {
@@ -1816,6 +1889,7 @@ public final class CoordinatorNode implements AutoCloseable {
         leaderId = null;
         leaderJac = Integer.MAX_VALUE;
         isLeader = false;
+        leaderReady = true;
         lastHeartbeatNanos = System.nanoTime();
     }
 
@@ -1839,7 +1913,26 @@ public final class CoordinatorNode implements AutoCloseable {
 
     public boolean isLeader() {
         synchronized (stateLock) {
-            return isLeader;
+            return isLeader && leaderReady;
+        }
+    }
+
+    private void awaitLocalLeaderReady() {
+        if (!localLeaderInstalling()) return;
+        long deadline = System.nanoTime() + TimeUnit.SECONDS.toNanos(5);
+        while (!closed.get() && !isLeader() && System.nanoTime() < deadline) {
+            try {
+                Thread.sleep(10);
+            } catch (InterruptedException e) {
+                Thread.currentThread().interrupt();
+                return;
+            }
+        }
+    }
+
+    private boolean localLeaderInstalling() {
+        synchronized (stateLock) {
+            return isLeader && !leaderReady;
         }
     }
 

@@ -61,6 +61,15 @@ public final class BootstrapWorkerMembership implements WorkerMembership {
     }
 
     @Override
+    public void reportRpcResult(WorkerEndpoint worker, boolean success) {
+        try {
+            client.reportWorkerRpcResult(worker, success);
+        } catch (RuntimeException ignored) {
+            // Local dispatch health still protects retries if Bootstrap is down.
+        }
+    }
+
+    @Override
     public long awaitChange(long observedVersion, Duration duration)
             throws InterruptedException {
         long nanos = duration.toNanos();

@@ -261,6 +261,7 @@ message ElectionResponse {
   string best_host = 4;
   int32 best_port = 5;
   int64 term = 6;
+  int64 best_progress_index = 7;
 }
 
 // COORDINATOR announcement flood. Informs every reachable worker of the
@@ -275,6 +276,7 @@ message CoordinatorAnnounce {
   int32 sender_id = 7;
   string sender_host = 8;
   int32 sender_port = 9;
+  int64 coordinator_progress_index = 10;
 }
 
 message CoordinatorAck {

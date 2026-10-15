@@ -12,6 +12,9 @@ public interface WorkerMembership extends AutoCloseable {
     /** Waits until the version changes or the duration expires. */
     long awaitChange(long observedVersion, Duration duration) throws InterruptedException;
 
+    /** Report task transport health for a specific registration when supported. */
+    default void reportRpcResult(WorkerEndpoint worker, boolean success) {}
+
     @Override
     void close();
 

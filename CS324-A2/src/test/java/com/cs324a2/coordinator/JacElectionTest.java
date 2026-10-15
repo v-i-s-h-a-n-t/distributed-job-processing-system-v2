@@ -16,6 +16,7 @@ import com.cs324a2.scheduler.WorkerMembership;
 import com.cs324a2.scheduler.WorkerRpcClient;
 import com.cs324a2.worker.WorkUnitProcessor;
 import com.cs324a2.worker.WorkerProtoMapper;
+import io.grpc.Status;
 import org.junit.jupiter.api.AfterEach;
 import org.junit.jupiter.api.Test;
 
@@ -24,6 +25,7 @@ import java.time.Duration;
 import java.util.ArrayList;
 import java.util.Collection;
 import java.util.List;
+import java.util.concurrent.CopyOnWriteArrayList;
 import java.util.concurrent.locks.Condition;
 import java.util.concurrent.locks.ReentrantLock;
 
@@ -50,6 +52,9 @@ class JacElectionTest {
         assertFalse(CoordinatorNode.isBetterCandidate(4, 2, 9, 2));
         // Identical candidates are not "better".
         assertFalse(CoordinatorNode.isBetterCandidate(5, 1, 5, 1));
+        // A newcomer with an empty replica cannot outrank a checkpoint holder.
+        assertTrue(CoordinatorNode.isBetterCandidate(1, 8, 12, 2, 0, 0));
+        assertFalse(CoordinatorNode.isBetterCandidate(2, 0, 0, 1, 8, 12));
     }
 
     @Test
@@ -112,6 +117,70 @@ class JacElectionTest {
         var state = node.handleGetState();
         assertEquals(4, state.getJac());
         assertEquals(26, state.getWorkerId());
+    }
+
+    @Test
+    void announcedLeaderPullsMissingCheckpointBeforeServing() throws Exception {
+        int firstPort = freePort();
+        int secondPort = freePort();
+        StaticMembership membership = new StaticMembership(List.of(
+                endpoint(31, firstPort), endpoint(32, secondPort)));
+        CoordinatorNode holder = start(31, firstPort, membership, new NoopRpcClient(),
+                SchedulerConfig.defaults());
+        CoordinatorNode newcomer = start(32, secondPort, membership, new NoopRpcClient(),
+                SchedulerConfig.defaults());
+        var job = com.cs324a2.grpc.coordinator.JobStateProto.newBuilder()
+                .setJob(com.cs324a2.grpc.coordinator.JobSpec.newBuilder()
+                        .setJobId("pulled-checkpoint")
+                        .setOperation(com.cs324a2.grpc.coordinator.Operation.MAX)
+                        .addNumbers(5).build())
+                .setStatus(com.cs324a2.grpc.coordinator.JobStatus.JOB_COMPLETED)
+                .setHasResult(true).setResultValue(5).setProgressIndex(7).build();
+        assertTrue(holder.handleReplicate(1, 99, 7, job).accepted());
+        var announce = com.cs324a2.grpc.coordinator.CoordinatorAnnounce.newBuilder()
+                .setCoordinatorMessageId("pull-test").setCoordinatorId(32)
+                .setCoordinatorHost("localhost").setCoordinatorPort(secondPort)
+                .setCoordinatorProgressIndex(0).setTerm(2).build();
+        newcomer.handlePropagateCoordinator(announce);
+        long deadline = System.currentTimeMillis() + 5_000;
+        while (!newcomer.isLeader() && System.currentTimeMillis() < deadline) {
+            Thread.sleep(20);
+        }
+        assertTrue(newcomer.isLeader());
+        assertEquals(7, newcomer.getProgress());
+        assertEquals(5, newcomer.handleGetState().getJobs(0).getResultValue());
+    }
+
+    @Test
+    void retryAvoidsFailedWorkerWhileMembershipStillListsIt() throws Exception {
+        int firstPort = freePort();
+        int secondPort = freePort();
+        StaticMembership membership = new StaticMembership(List.of(
+                endpoint(41, firstPort), endpoint(42, secondPort)));
+        List<String> calls = new CopyOnWriteArrayList<>();
+        WorkUnitProcessor processor = new WorkUnitProcessor();
+        WorkerRpcClient rpc = new WorkerRpcClient() {
+            @Override public ExecuteTaskResponse execute(WorkerEndpoint worker,
+                    ExecuteTaskRequest request, Duration timeout) {
+                calls.add(worker.getWorkerId() + ":" + request.getAttempt());
+                if (worker.getWorkerId() == 41) {
+                    throw Status.UNAVAILABLE.asRuntimeException();
+                }
+                return WorkerProtoMapper.toResponse(request, worker.getWorkerId(),
+                        processor.execute(WorkerProtoMapper.toWorkUnit(request)));
+            }
+            @Override public void close() {}
+            @Override public void retainWorkers(long version,
+                    Collection<WorkerEndpoint> workers) {}
+        };
+        start(41, firstPort, membership, rpc, SchedulerConfig.defaults());
+        CoordinatorNode leader = start(42, secondPort, membership, rpc,
+                SchedulerConfig.defaults());
+        leader.initiateElection();
+        assertEquals(9, leader.submitJob(JobRequest.max("retry-dead-worker", List.of(5, 9))));
+        assertTrue(calls.contains("41:1"));
+        assertFalse(calls.contains("41:2"));
+        assertTrue(calls.contains("42:2"));
     }
 
     @Test
