@@ -37,6 +37,8 @@ Worker and coordinator nodes. Arguments are
 mvn exec:java -Dexec.mainClass=com.cs324a2.coordinator.CoordinatorServer -Dexec.args="1 localhost 51001 localhost 50051"
 mvn exec:java -Dexec.mainClass=com.cs324a2.coordinator.CoordinatorServer -Dexec.args="2 localhost 51002 localhost 50051"
 mvn exec:java -Dexec.mainClass=com.cs324a2.coordinator.CoordinatorServer -Dexec.args="3 localhost 51003 localhost 50051"
+mvn exec:java -Dexec.mainClass=com.cs324a2.coordinator.CoordinatorServer -Dexec.args="4 localhost 51004 localhost 50051"
+mvn exec:java -Dexec.mainClass=com.cs324a2.coordinator.CoordinatorServer -Dexec.args="5 localhost 51005 localhost 50051"
 ```
 
 Client GUI:
