@@ -156,7 +156,11 @@ public final class GrpcClientService implements AutoCloseable {
     private static boolean retryable(StatusRuntimeException error) {
         return error.getStatus().getCode() == Status.Code.UNAVAILABLE
                 || error.getStatus().getCode() == Status.Code.DEADLINE_EXCEEDED
-                || error.getStatus().getCode() == Status.Code.CANCELLED;
+                || error.getStatus().getCode() == Status.Code.CANCELLED
+                // A coordinator can disappear while its SubmitJob handler is
+                // running. gRPC may surface that interrupted handler as UNKNOWN
+                // rather than UNAVAILABLE; the job ID makes resubmission safe.
+                || error.getStatus().getCode() == Status.Code.UNKNOWN;
     }
 
     private String submitOnce(JobRequest request) throws Exception {
