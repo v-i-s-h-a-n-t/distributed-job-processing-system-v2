@@ -5,13 +5,17 @@ import static org.junit.jupiter.api.Assertions.assertFalse;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 
 import com.cs324a2.grpc.bootstrap.MembershipEvent;
+import com.cs324a2.grpc.coordinator.CoordinatorServiceGrpc;
+import com.cs324a2.grpc.coordinator.PingResponse;
 import io.grpc.Server;
+import io.grpc.ServerBuilder;
 import io.grpc.Status;
 import io.grpc.StatusRuntimeException;
 import io.grpc.stub.StreamObserver;
 import io.grpc.inprocess.InProcessChannelBuilder;
 import io.grpc.inprocess.InProcessServerBuilder;
 import java.time.Duration;
+import java.net.ServerSocket;
 import java.util.concurrent.BlockingQueue;
 import java.util.concurrent.LinkedBlockingQueue;
 import java.util.concurrent.TimeUnit;
@@ -86,6 +90,32 @@ class BootstrapGrpcServiceTest {
         assertTrue(client.reportWorkerRpcResult(endpoint, false));
         assertTrue(client.listWorkers().activeWorkers().isEmpty());
         assertFalse(client.heartbeat(8, registration.registrationId()));
+    }
+
+    @Test
+    void reporterCannotRemoveWorkerReachableFromBootstrap() throws Exception {
+        int port;
+        try (ServerSocket socket = new ServerSocket(0)) {
+            port = socket.getLocalPort();
+        }
+        Server worker = ServerBuilder.forPort(port).addService(
+                new CoordinatorServiceGrpc.CoordinatorServiceImplBase() {
+                    @Override public void ping(
+                            com.cs324a2.grpc.coordinator.PingRequest request,
+                            StreamObserver<PingResponse> observer) {
+                        observer.onNext(PingResponse.newBuilder().setWorkerId(9).build());
+                        observer.onCompleted();
+                    }
+                }).build().start();
+        try {
+            client.register(9, "localhost", port);
+            var endpoint = client.listWorkers().activeWorkers().get(0);
+            assertFalse(client.reportWorkerRpcResult(endpoint, false));
+            assertFalse(client.reportWorkerRpcResult(endpoint, false));
+            assertEquals(1, client.listWorkers().activeWorkers().size());
+        } finally {
+            worker.shutdownNow();
+        }
     }
 
     @Test

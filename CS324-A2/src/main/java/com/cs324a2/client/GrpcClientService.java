@@ -129,11 +129,11 @@ public final class GrpcClientService implements AutoCloseable {
 
     /** Returns the exact decimal result, including sums outside signed 64-bit. */
     public String submitExact(JobRequest request) throws Exception {
-        if (request.operation() != ComputeOperation.PRIMESUM) return submitOnce(request);
         while (!closed && !Thread.currentThread().isInterrupted()) {
             try {
                 return submitOnce(request);
             } catch (StatusRuntimeException unavailable) {
+                if (!retryable(unavailable)) throw unavailable;
                 try {
                     JobProgressUpdate terminal = fetchJobProgress(request.jobId());
                     if (terminal != null) {
@@ -150,7 +150,13 @@ public final class GrpcClientService implements AutoCloseable {
                 Thread.sleep(500);
             }
         }
-        throw new InterruptedException("PrimeSum submission stopped");
+        throw new InterruptedException("job submission stopped");
+    }
+
+    private static boolean retryable(StatusRuntimeException error) {
+        return error.getStatus().getCode() == Status.Code.UNAVAILABLE
+                || error.getStatus().getCode() == Status.Code.DEADLINE_EXCEEDED
+                || error.getStatus().getCode() == Status.Code.CANCELLED;
     }
 
     private String submitOnce(JobRequest request) throws Exception {
@@ -188,6 +194,7 @@ public final class GrpcClientService implements AutoCloseable {
             } catch (JobFailedException e) {
                 throw e;
             } catch (StatusRuntimeException e) {
+                if (!retryable(e)) throw e;
                 lastFailure = e;
             }
         }
@@ -208,6 +215,7 @@ public final class GrpcClientService implements AutoCloseable {
             } catch (JobFailedException e) {
                 throw e;
             } catch (StatusRuntimeException e) {
+                if (!retryable(e)) throw e;
                 lastFailure = e;
             }
         }

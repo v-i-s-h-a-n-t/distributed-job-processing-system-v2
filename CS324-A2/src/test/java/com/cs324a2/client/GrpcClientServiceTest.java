@@ -175,6 +175,21 @@ class GrpcClientServiceTest {
                 }
             });
             assertEquals(77L, later.get(60, TimeUnit.SECONDS));
+            // Six submissions overlap and cross the five-admission boundary.
+            List<CompletableFuture<Long>> concurrent = new ArrayList<>();
+            for (int i = 3; i <= 8; i++) {
+                String jobId = "gui-term-job-" + i;
+                concurrent.add(CompletableFuture.supplyAsync(() -> {
+                    try {
+                        return gui.submit(JobRequest.max(jobId, List.of(3, 9, 2)));
+                    } catch (Exception e) {
+                        throw new RuntimeException(e);
+                    }
+                }));
+            }
+            for (CompletableFuture<Long> job : concurrent) {
+                assertEquals(9L, job.get(60, TimeUnit.SECONDS));
+            }
         }
     }
 

@@ -61,6 +61,26 @@ public final class BootstrapWorkerMembership implements WorkerMembership {
     }
 
     @Override
+    public Snapshot refresh() {
+        BootstrapClient.WorkerSnapshot latest = client.listWorkers();
+        lock.lock();
+        try {
+            if (latest.membershipVersion() >= sourceVersion) {
+                workers.clear();
+                for (WorkerEndpoint endpoint : latest.activeWorkers()) {
+                    workers.put(endpoint.getWorkerId(), endpoint);
+                }
+                sourceVersion = latest.membershipVersion();
+                version++;
+                changed.signalAll();
+            }
+        } finally {
+            lock.unlock();
+        }
+        return snapshot();
+    }
+
+    @Override
     public void reportRpcResult(WorkerEndpoint worker, boolean success) {
         try {
             client.reportWorkerRpcResult(worker, success);

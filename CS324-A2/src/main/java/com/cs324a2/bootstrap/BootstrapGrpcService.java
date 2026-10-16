@@ -16,7 +16,12 @@ import com.cs324a2.grpc.bootstrap.WatchMembershipRequest;
 import com.cs324a2.grpc.bootstrap.WorkerEndpoint;
 import com.cs324a2.grpc.bootstrap.WorkerRpcResultRequest;
 import com.cs324a2.grpc.bootstrap.WorkerRpcResultResponse;
+import com.cs324a2.grpc.coordinator.CoordinatorServiceGrpc;
+import com.cs324a2.grpc.coordinator.PingRequest;
+import io.grpc.ManagedChannel;
+import io.grpc.ManagedChannelBuilder;
 import io.grpc.Status;
+import io.grpc.StatusRuntimeException;
 import io.grpc.stub.ServerCallStreamObserver;
 import io.grpc.stub.StreamObserver;
 
@@ -184,6 +189,7 @@ public final class BootstrapGrpcService
     public void reportWorkerRpcResult(WorkerRpcResultRequest request,
                                       StreamObserver<WorkerRpcResultResponse> observer) {
         boolean removed = false;
+        WorkerEndpoint verify = null;
         synchronized (membershipLock) {
             WorkerRegistration registration = workers.get(request.getWorkerId());
             if (registration != null && registration.endpoint().getRegistrationId()
@@ -192,10 +198,25 @@ public final class BootstrapGrpcService
                     rpcFailures.remove(request.getWorkerId());
                 } else {
                     int failures = rpcFailures.merge(request.getWorkerId(), 1, Integer::sum);
-                    if (failures >= 2 && workers.remove(request.getWorkerId(), registration)) {
-                        rpcFailures.remove(request.getWorkerId());
-                        publishWorkerLeftLocked(registration.endpoint(),
-                                "removed after repeated RPC failures");
+                    if (failures >= 2) verify = registration.endpoint();
+                }
+            }
+        }
+        // A reporter may be partitioned from a healthy worker. Bootstrap
+        // verifies reachability itself before changing the voter set.
+        if (verify != null) {
+            boolean reachable = canPing(verify);
+            synchronized (membershipLock) {
+                WorkerRegistration current = workers.get(verify.getWorkerId());
+                if (current != null && current.endpoint().getRegistrationId()
+                        .equals(verify.getRegistrationId())) {
+                    if (reachable) {
+                        rpcFailures.remove(verify.getWorkerId());
+                    } else if (rpcFailures.getOrDefault(verify.getWorkerId(), 0) >= 2
+                            && workers.remove(verify.getWorkerId(), current)) {
+                        rpcFailures.remove(verify.getWorkerId());
+                        publishWorkerLeftLocked(verify,
+                                "removed after Bootstrap reachability check failed");
                         removed = true;
                     }
                 }
@@ -203,6 +224,21 @@ public final class BootstrapGrpcService
         }
         observer.onNext(WorkerRpcResultResponse.newBuilder().setRemoved(removed).build());
         observer.onCompleted();
+    }
+
+    private static boolean canPing(WorkerEndpoint endpoint) {
+        ManagedChannel channel = ManagedChannelBuilder.forAddress(
+                endpoint.getHost(), endpoint.getPort()).usePlaintext().build();
+        try {
+            return CoordinatorServiceGrpc.newBlockingStub(channel)
+                    .withDeadlineAfter(500, TimeUnit.MILLISECONDS)
+                    .ping(PingRequest.newBuilder().setCallerId(0).build())
+                    .getWorkerId() == endpoint.getWorkerId();
+        } catch (StatusRuntimeException e) {
+            return false;
+        } finally {
+            channel.shutdownNow();
+        }
     }
 
     @Override

@@ -17,6 +17,7 @@ import com.cs324a2.grpc.coordinator.JobStateProto;
 import com.cs324a2.grpc.coordinator.JobStatus;
 import com.cs324a2.grpc.coordinator.WorkerProgress;
 import com.cs324a2.scheduler.JobExecutionException;
+import com.cs324a2.scheduler.BootstrapWorkerMembership;
 import com.cs324a2.scheduler.SchedulerConfig;
 import com.cs324a2.scheduler.WorkerMembership;
 import com.cs324a2.scheduler.WorkerRpcClient;
@@ -34,6 +35,7 @@ import java.io.IOException;
 import java.time.Duration;
 import java.util.ArrayList;
 import java.util.Comparator;
+import java.util.HashSet;
 import java.util.List;
 import java.util.Set;
 import java.util.concurrent.ConcurrentHashMap;
@@ -427,25 +429,39 @@ public final class CoordinatorNode implements AutoCloseable {
                 stepDownLocked(term);
                 leaderId = heartbeatLeaderId;
                 leaderJac = heartbeatLeaderJac;
+                leaderProgressIndex = commitProgress;
                 lastHeartbeatNanos = System.nanoTime();
-                store.observeProgress(commitProgress);
                 return new HeartbeatOutcome(currentTerm, true);
             }
             if (leaderId == null) {
                 leaderId = heartbeatLeaderId;
                 leaderJac = heartbeatLeaderJac;
+                leaderProgressIndex = commitProgress;
                 lastHeartbeatNanos = System.nanoTime();
-                store.observeProgress(commitProgress);
                 return new HeartbeatOutcome(currentTerm, true);
             }
             if (!leaderId.equals(heartbeatLeaderId)) {
-                // Split-brain protection: only the first leader per term is valid.
+                // Concurrent flood elections can announce different winners in
+                // the same term. Apply the same deterministic ordering used by
+                // COORDINATOR announcements before accepting checkpoints.
+                if (heartbeatLeaderJac != Integer.MAX_VALUE
+                        && leaderJac != Integer.MAX_VALUE
+                        && isBetterCandidate(heartbeatLeaderId, heartbeatLeaderJac,
+                        commitProgress, leaderId, leaderJac, leaderProgressIndex)) {
+                    leaderId = heartbeatLeaderId;
+                    leaderJac = heartbeatLeaderJac;
+                    leaderProgressIndex = commitProgress;
+                    isLeader = false;
+                    lastHeartbeatNanos = System.nanoTime();
+                    return new HeartbeatOutcome(currentTerm, true);
+                }
                 System.err.printf("[Coordinator %d] rejected second leader %d for term %d"
                                 + " (recognised leader=%d)%n",
                         workerId, heartbeatLeaderId, currentTerm, leaderId);
                 return new HeartbeatOutcome(currentTerm, false);
             }
             leaderJac = heartbeatLeaderJac;
+            leaderProgressIndex = Math.max(leaderProgressIndex, commitProgress);
             lastHeartbeatNanos = System.nanoTime();
             // Heartbeat progress is a hint, not a replicated checkpoint.
             // Advancing the local watermark here could let an empty replica
@@ -525,6 +541,14 @@ public final class CoordinatorNode implements AutoCloseable {
                     .setError(e.getMessage() == null ? "job failed" : e.getMessage());
             if (failed != null) builder.setProgressIndex(failed.progressIndex());
             return builder.build();
+        } catch (RuntimeException e) {
+            // Closing a coordinator can interrupt an in-flight dispatch at
+            // executor or channel boundaries. The checkpoint is still
+            // recoverable, so report a retryable leadership outcome.
+            if (closed.get() || !isLeader()) {
+                return response.setExecuted(false).build();
+            }
+            throw e;
         }
     }
 
@@ -1299,6 +1323,11 @@ public final class CoordinatorNode implements AutoCloseable {
         // Idempotent admission: a retried client or a resumed job reuses checkpoints.
         ReplicatedJobStore.JobRecord existing = store.get(request.jobId());
         if (existing != null) {
+            confirmLeadership();
+            if (!replicate(existing)) {
+                throw new NotLeaderException("job checkpoint has no replica quorum",
+                        leaderId(), null, -1);
+            }
             if (existing.status() == ReplicatedJobStore.JobStatus.COMPLETED) {
                 return existing.resultValue();
             }
@@ -1308,10 +1337,10 @@ public final class CoordinatorNode implements AutoCloseable {
             }
             return resumeJob(request.jobId());
         }
+        confirmLeadership();
         // One-term / five-job admission: increments JAC + term count.
         JobAdmission admission = admitTopLevelJob();
         try {
-            confirmLeadership();
             long term = getCurrentTerm();
             List<WorkerEndpoint> members = membership.snapshot().workers();
             int partitions = partitionCountFor(request, members.size());
@@ -1322,14 +1351,20 @@ public final class CoordinatorNode implements AutoCloseable {
                 System.out.printf("[Coordinator %d] event=ADMIT progress=%d jobId=%s term=%d (empty) JAC=%d termCount=%d/%d%n",
                         workerId, admitted.progressIndex(), request.jobId(), term,
                         admission.jac(), admission.termCount(), MAX_JOBS_PER_TERM);
-                replicate(admitted.snapshot());
+                if (!replicate(admitted.snapshot())) {
+                    throw new NotLeaderException("job checkpoint has no replica quorum",
+                            leaderId(), null, -1);
+                }
                 return 0L;
             }
             admitted = store.createJob(request, units, term);
             System.out.printf("[Coordinator %d] event=ADMIT progress=%d jobId=%s term=%d tasks=%d JAC=%d termCount=%d/%d%n",
                     workerId, admitted.progressIndex(), request.jobId(), term, units.size(),
                     admission.jac(), admission.termCount(), MAX_JOBS_PER_TERM);
-            replicate(admitted.snapshot());
+            if (!replicate(admitted.snapshot())) {
+                throw new NotLeaderException("job checkpoint has no replica quorum",
+                        leaderId(), null, -1);
+            }
             return runDispatchLoop(request.jobId());
         } finally {
             completeTopLevelJob(admission);
@@ -1348,8 +1383,8 @@ public final class CoordinatorNode implements AutoCloseable {
             }
             synchronized (termStateLock) {
                 if (termClosing || jobsInCurrentTerm.get() >= MAX_JOBS_PER_TERM) {
-                    throw new JobExecutionException("Coordinator term is transitioning;"
-                            + " try the new coordinator");
+                    throw new NotLeaderException("Coordinator term is transitioning;"
+                            + " try the new coordinator", leaderId, null, -1);
                 }
                 int newJac = jac.incrementAndGet();
                 int termCount = jobsInCurrentTerm.incrementAndGet();
@@ -1911,16 +1946,17 @@ public final class CoordinatorNode implements AutoCloseable {
         throw new JobExecutionException("job " + jobId + " failed: " + reason);
     }
 
-    private void replicate(ReplicatedJobStore.JobRecord snapshot) {
+    private boolean replicate(ReplicatedJobStore.JobRecord snapshot) {
         JobStateProto proto = CoordinatorJobMapper.toJobProto(snapshot);
         long progress = snapshot.progressIndex();
         long term;
         List<WorkerEndpoint> peers;
         synchronized (stateLock) {
-            if (!isLeader) return;
+            if (!isLeader) return false;
             term = currentTerm;
             peers = membership.snapshot().workers();
         }
+        int acks = 1;
         for (WorkerEndpoint peer : peers) {
             if (peer.getWorkerId() == workerId) continue;
             try {
@@ -1933,13 +1969,15 @@ public final class CoordinatorNode implements AutoCloseable {
                     synchronized (stateLock) {
                         stepDownLocked(response.getTerm());
                     }
-                    return;
+                    return false;
                 }
+                if (response.getSuccess() && response.getTerm() == term) acks++;
             } catch (RuntimeException e) {
                 System.err.printf("[Coordinator %d] replicate progress=%d to %d failed: %s%n",
                         workerId, progress, peer.getWorkerId(), e.getMessage());
             }
         }
+        return acks >= quorumOf(peers);
     }
 
     // ---- Leadership guards (split-brain protection) ----
@@ -1951,10 +1989,23 @@ public final class CoordinatorNode implements AutoCloseable {
             if (!isLeader) throw new NotLeaderException("not the leader",
                     leaderId, null, -1);
             term = currentTerm;
-            peers = membership.snapshot().workers();
         }
-        int quorum = quorumOf(peers);
-        int acks = 1; // self
+        // Bootstrap is the membership authority. Admissions must not rely on
+        // a cached view when this node has lost contact with Bootstrap.
+        try {
+            peers = membership.refresh().workers();
+        } catch (RuntimeException e) {
+            throw new NotLeaderException("membership is temporarily unavailable; retry",
+                    leaderId(), null, -1);
+        }
+        if (membership instanceof BootstrapWorkerMembership && peers.stream()
+                .noneMatch(peer -> peer.getWorkerId() == workerId)) {
+            throw new NotLeaderException("worker is no longer registered",
+                    leaderId(), null, -1);
+        }
+        Set<Integer> acked = new HashSet<>();
+        acked.add(workerId);
+        boolean hadTransportFailure = false;
         int jacNow = jac.get();
         for (WorkerEndpoint peer : peers) {
             if (peer.getWorkerId() == workerId) continue;
@@ -1973,11 +2024,45 @@ public final class CoordinatorNode implements AutoCloseable {
                     throw new NotLeaderException("stepped down: saw term "
                             + response.getTerm(), leaderId(), null, -1);
                 }
-                if (response.getSuccess()) acks++;
+                if (response.getSuccess()) {
+                    acked.add(peer.getWorkerId());
+                    membership.reportRpcResult(peer, true);
+                }
             } catch (StatusRuntimeException e) {
-                // Unreachable peer withholds its ack.
+                hadTransportFailure = true;
+                // Bootstrap leases can outlive a killed worker. Confirm the
+                // failure and report both observations so Bootstrap can evict
+                // the stale registration before its lease expires.
+                membership.reportRpcResult(peer, false);
+                try {
+                    var retry = coordClient.heartbeat(peer.getHost(), peer.getPort(),
+                            com.cs324a2.grpc.coordinator.LeaderHeartbeatRequest
+                                    .newBuilder().setTerm(term).setLeaderId(workerId)
+                                    .setLeaderHost(host).setLeaderPort(port)
+                                    .setCommitProgressIndex(store.progress())
+                                    .setLeaderJac(jacNow).build(), RPC_TIMEOUT_MILLIS);
+                    if (retry.getTerm() > term) {
+                        synchronized (stateLock) {
+                            stepDownLocked(retry.getTerm());
+                        }
+                        throw new NotLeaderException("stepped down: saw term "
+                                + retry.getTerm(), leaderId(), null, -1);
+                    }
+                    if (retry.getSuccess()) {
+                        acked.add(peer.getWorkerId());
+                        membership.reportRpcResult(peer, true);
+                    }
+                } catch (StatusRuntimeException retryFailure) {
+                    membership.reportRpcResult(peer, false);
+                }
             }
         }
+        List<WorkerEndpoint> voters = hadTransportFailure
+                ? membership.refresh().workers() : peers;
+        int quorum = quorumOf(voters);
+        int acks = (int) voters.stream()
+                .filter(peer -> acked.contains(peer.getWorkerId())).count();
+        if (voters.isEmpty()) acks = 1;
         if (acks < quorum) {
             throw new JobExecutionException("leader " + workerId
                     + " lost quorum (" + acks + "/" + quorum + "); refusing job");

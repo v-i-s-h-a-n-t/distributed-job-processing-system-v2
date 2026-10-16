@@ -9,6 +9,9 @@ import java.util.List;
 public interface WorkerMembership extends AutoCloseable {
     Snapshot snapshot();
 
+    /** Refreshes the authoritative membership when the source supports it. */
+    default Snapshot refresh() { return snapshot(); }
+
     /** Waits until the version changes or the duration expires. */
     long awaitChange(long observedVersion, Duration duration) throws InterruptedException;
 

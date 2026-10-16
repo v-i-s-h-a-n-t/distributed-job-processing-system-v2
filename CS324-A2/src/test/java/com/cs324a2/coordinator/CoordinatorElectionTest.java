@@ -109,6 +109,26 @@ class CoordinatorElectionTest {
         assertTrue(node.jobs().isEmpty());
     }
 
+    @Test
+    void betterAnnouncedLeaderHeartbeatReconcilesSameTermBeforeReplication() {
+        CoordinatorNode node = node(1);
+        assertTrue(node.handleHeartbeat(10, 2, "localhost", 51998, 0, 4).accepted());
+        // Concurrent election floods can announce a more current winner in
+        // the same term. The follower must follow it before its checkpoint.
+        assertTrue(node.handleHeartbeat(10, 3, "localhost", 51999, 1, 0).accepted());
+        assertEquals(3, node.leaderId());
+        assertTrue(node.handleReplicate(10, 3, 1,
+                jobState("elected-job", 1, 10)).accepted());
+        assertEquals(1, node.jobs().size());
+    }
+
+    @Test
+    void heartbeatProgressDoesNotMakeEmptyReplicaEligibleAsCurrent() {
+        CoordinatorNode node = node(1);
+        assertTrue(node.handleHeartbeat(10, 2, "localhost", 51998, 99, 0).accepted());
+        assertEquals(0, node.getProgress());
+    }
+
     private CoordinatorNode node(int workerId) {
         CoordinatorNode node = new CoordinatorNode(workerId, "localhost",
                 51990 + workerId, new EmptyMembership(), new NoopRpcClient(),

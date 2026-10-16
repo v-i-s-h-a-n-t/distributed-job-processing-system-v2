@@ -9,16 +9,22 @@ import static org.junit.jupiter.api.Assertions.fail;
 
 import com.cs324a2.common.JobRequest;
 import com.cs324a2.common.WorkResult;
+import com.cs324a2.bootstrap.BootstrapClient;
+import com.cs324a2.bootstrap.BootstrapGrpcService;
+import com.cs324a2.client.GrpcClientService;
 import com.cs324a2.grpc.bootstrap.WorkerEndpoint;
 import com.cs324a2.grpc.worker.ExecuteTaskRequest;
 import com.cs324a2.grpc.worker.ExecuteTaskResponse;
 import com.cs324a2.scheduler.JobExecutionException;
+import com.cs324a2.scheduler.BootstrapWorkerMembership;
 import com.cs324a2.scheduler.SchedulerConfig;
 import com.cs324a2.scheduler.WorkerMembership;
 import com.cs324a2.scheduler.WorkerRpcClient;
 import com.cs324a2.worker.WorkUnitProcessor;
 import com.cs324a2.worker.WorkerProtoMapper;
 import io.grpc.Status;
+import io.grpc.Server;
+import io.grpc.ServerBuilder;
 import org.junit.jupiter.api.AfterEach;
 import org.junit.jupiter.api.Test;
 
@@ -156,6 +162,85 @@ class CoordinatorFailoverTest {
                 follower.workerId(), later);
 
         assertSingleLeader(survivors);
+    }
+
+    @Test
+    void staleMembershipDoesNotBlockSingleSurvivorAdmission() throws Exception {
+        int[] ports = {freePort(), freePort(), freePort()};
+        int bootstrapPort = freePort();
+        BootstrapGrpcService bootstrap = new BootstrapGrpcService();
+        Server server = ServerBuilder.forPort(bootstrapPort)
+                .addService(bootstrap).build().start();
+        try (BootstrapClient registrations = new BootstrapClient("localhost", bootstrapPort);
+             BootstrapWorkerMembership membership =
+                     new BootstrapWorkerMembership("localhost", bootstrapPort)) {
+            for (int i = 0; i < 3; i++) {
+                registrations.register(i + 1, "localhost", ports[i]);
+            }
+            membership.start();
+            assertEquals(3, membership.snapshot().workers().size());
+            // The first two registered processes are already dead, but their
+            // eight-second Bootstrap leases are still in the membership view.
+            CoordinatorNode survivor = start(3, ports[2], membership,
+                    new BlockingRpcClient(), SchedulerConfig.defaults());
+            assertEquals(0L, survivor.submitJob(
+                    JobRequest.primeCount("single-survivor", List.of())));
+            assertEquals(1, registrations.listWorkers().activeWorkers().size());
+        } finally {
+            server.shutdownNow();
+            bootstrap.close();
+        }
+    }
+
+    @Test
+    void clientRetriesMaxAndPrimeCountAfterLeaderDiesMidJob() throws Exception {
+        assertClientSurvivesLeaderKill(JobRequest.max(
+                "client-failover-max", List.of(3, 7, 1, 9, 2, 8)), 9L);
+        assertClientSurvivesLeaderKill(JobRequest.primeCount(
+                "client-failover-count", List.of(2, 3, 4, 5, 8, 11)), 4L);
+    }
+
+    private void assertClientSurvivesLeaderKill(JobRequest request, long expected)
+            throws Exception {
+        int[] ports = {freePort(), freePort(), freePort()};
+        List<WorkerEndpoint> endpoints = List.of(
+                endpoint(1, ports[0]), endpoint(2, ports[1]), endpoint(3, ports[2]));
+        StaticMembership membership = new StaticMembership(endpoints);
+        BlockingRpcClient rpc = new BlockingRpcClient();
+        SchedulerConfig config = new SchedulerConfig(Duration.ofSeconds(8),
+                Duration.ofSeconds(60), Duration.ofMillis(100), 5, 8, 128);
+        List<CoordinatorNode> cluster = List.of(
+                start(1, ports[0], membership, rpc, config),
+                start(2, ports[1], membership, rpc, config),
+                start(3, ports[2], membership, rpc, config));
+        cluster.get(0).initiateElection();
+        CoordinatorNode leader = awaitSingleLeader(cluster, 20_000);
+
+        int bootstrapPort = freePort();
+        BootstrapGrpcService bootstrap = new BootstrapGrpcService();
+        Server server = ServerBuilder.forPort(bootstrapPort)
+                .addService(bootstrap).build().start();
+        try (BootstrapClient registrations = new BootstrapClient("localhost", bootstrapPort);
+             GrpcClientService client = new GrpcClientService("localhost", bootstrapPort)) {
+            for (int i = 0; i < 3; i++) {
+                registrations.register(i + 1, "localhost", ports[i]);
+            }
+            CompletableFuture<Long> result = CompletableFuture.supplyAsync(() -> {
+                try {
+                    return client.submit(request);
+                } catch (Exception e) {
+                    throw new RuntimeException(e);
+                }
+            }, clients);
+            assertTrue(rpc.partitionZeroEntered.await(10, TimeUnit.SECONDS));
+            leader.close();
+            rpc.markDead(leader.workerId());
+            assertEquals(expected, result.get(30, TimeUnit.SECONDS));
+        } finally {
+            server.shutdownNow();
+            bootstrap.close();
+            for (CoordinatorNode node : cluster) node.close();
+        }
     }
 
     // ---- Helpers ----
@@ -308,7 +393,8 @@ class CoordinatorFailoverTest {
                 throw Status.UNAVAILABLE.withDescription(
                         "worker " + worker.getWorkerId() + " is dead").asRuntimeException();
             }
-            if (request.getJobId().equals("failover-job")
+            if ((request.getJobId().equals("failover-job")
+                    || request.getJobId().startsWith("client-failover-"))
                     && request.getPartitionId() == 0
                     && request.getAttempt() == 1) {
                 partitionZeroEntered.countDown();
