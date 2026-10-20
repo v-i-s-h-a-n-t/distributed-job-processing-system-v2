@@ -1132,7 +1132,10 @@ public final class CoordinatorNode implements AutoCloseable {
         leaderJac = electedJac;
         leaderProgressIndex = electedProgress;
         isLeader = (electedId == workerId);
-        leaderReady = !isLeader || (was && leaderReady);
+        boolean hasRecoveryPeer = !neighbors.isEmpty()
+                || membership.snapshot().workers().stream()
+                .anyMatch(peer -> peer.getWorkerId() != workerId);
+        leaderReady = !isLeader || !hasRecoveryPeer || (was && leaderReady);
         lastHeartbeatNanos = System.nanoTime();
         boolean became = isLeader && !was;
         synchronized (termStateLock) {
