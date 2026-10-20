@@ -24,29 +24,29 @@ classpath.
 
 Each command runs in its own terminal, from `CS324-A2`.
 In PowerShell, quote each Maven `-D` property as one argument, for example
-`mvn exec:java '-Dexec.mainClass=com.cs324a2.bootstrap.BootstrapServer' '-Dexec.args=50051'`.
+`mvn exec:java "-Dexec.mainClass=com.cs324a2.bootstrap.BootstrapServer" "-Dexec.args=50051"`.
 
 Bootstrap, the membership directory:
 
-```bash
-mvn exec:java -Dexec.mainClass=com.cs324a2.bootstrap.BootstrapServer -Dexec.args="50051"
+```powershell
+mvn exec:java "-Dexec.mainClass=com.cs324a2.bootstrap.BootstrapServer" "-Dexec.args=50051"
 ```
 
 Worker and coordinator nodes. Arguments are
 `<workerId> <advertisedHost> <workerPort> <bootstrapHost> <bootstrapPort>`.
 
-```bash
-mvn exec:java -Dexec.mainClass=com.cs324a2.coordinator.CoordinatorServer -Dexec.args="1 localhost 51001 localhost 50051"
-mvn exec:java -Dexec.mainClass=com.cs324a2.coordinator.CoordinatorServer -Dexec.args="2 localhost 51002 localhost 50051"
-mvn exec:java -Dexec.mainClass=com.cs324a2.coordinator.CoordinatorServer -Dexec.args="3 localhost 51003 localhost 50051"
-mvn exec:java -Dexec.mainClass=com.cs324a2.coordinator.CoordinatorServer -Dexec.args="4 localhost 51004 localhost 50051"
-mvn exec:java -Dexec.mainClass=com.cs324a2.coordinator.CoordinatorServer -Dexec.args="5 localhost 51005 localhost 50051"
+```powershell
+mvn exec:java "-Dexec.mainClass=com.cs324a2.coordinator.CoordinatorServer" "-Dexec.args=1 localhost 51001 localhost 50051"
+mvn exec:java "-Dexec.mainClass=com.cs324a2.coordinator.CoordinatorServer" "-Dexec.args=2 localhost 51002 localhost 50051"
+mvn exec:java "-Dexec.mainClass=com.cs324a2.coordinator.CoordinatorServer" "-Dexec.args=3 localhost 51003 localhost 50051"
+mvn exec:java "-Dexec.mainClass=com.cs324a2.coordinator.CoordinatorServer" "-Dexec.args=4 localhost 51004 localhost 50051"
+mvn exec:java "-Dexec.mainClass=com.cs324a2.coordinator.CoordinatorServer" "-Dexec.args=5 localhost 51005 localhost 50051"
 ```
 
 Client GUI:
 
-```bash
-mvn exec:java -Dexec.mainClass=com.cs324a2.client.ClientApp
+```powershell
+mvn exec:java "-Dexec.mainClass=com.cs324a2.client.ClientApp"
 ```
 
 One node logs `*** BECAME COORDINATOR *** term=N`.
