@@ -23,6 +23,8 @@ classpath.
 ## Running the cluster
 
 Each command runs in its own terminal, from `CS324-A2`.
+In PowerShell, quote each Maven `-D` property as one argument, for example
+`mvn exec:java '-Dexec.mainClass=com.cs324a2.bootstrap.BootstrapServer' '-Dexec.args=50051'`.
 
 Bootstrap, the membership directory:
 
@@ -99,10 +101,13 @@ operations. A `PRIMESUM` CSV contains one `start,end` row.
 
 ### Progress
 
-The bar shows `completedTasks / totalTasks` taken from real task checkpoints,
-streamed over gRPC with `SubscribeJobProgress`. It does not advance on a timer.
+For `PRIMESUM`, the bar shows the fraction of the input range processed; for
+list jobs, it shows completed tasks divided by total tasks. Both come from real
+checkpoints streamed over gRPC with `SubscribeJobProgress`, not a timer. The
+displayed percentage is rounded to a whole number.
 Range jobs are split into 4 sub-ranges per worker, capped at 32 tasks per job, so
-long sieves report progress steadily.
+long sieves report progress as chunks finish. Shared worker capacity and task
+retries can delay updates when several large jobs run together.
 
 Click a bar for the worker breakdown: per-worker counts plus per-task detail
 (partition, status, worker, attempt, result). It refreshes while the job runs

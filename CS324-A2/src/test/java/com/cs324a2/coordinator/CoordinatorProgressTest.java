@@ -43,6 +43,7 @@ import org.junit.jupiter.api.Test;
 class CoordinatorProgressTest {
     private final List<CoordinatorNode> nodes = new ArrayList<>();
     private final List<ManagedChannel> channels = new ArrayList<>();
+    private final List<GrpcWorkerRpcClient> taskClients = new ArrayList<>();
     private final ExecutorService clients = Executors.newCachedThreadPool(task -> {
         Thread thread = new Thread(task, "progress-test");
         thread.setDaemon(true);
@@ -66,6 +67,7 @@ class CoordinatorProgressTest {
                 // Best-effort test cleanup.
             }
         }
+        taskClients.forEach(GrpcWorkerRpcClient::close);
     }
 
     @Test
@@ -311,6 +313,7 @@ class CoordinatorProgressTest {
     private CoordinatorNode start(int workerId, int port, WorkerMembership membership,
                                   WorkerRpcClient rpc, SchedulerConfig config)
             throws Exception {
+        if (rpc instanceof GrpcWorkerRpcClient grpc) taskClients.add(grpc);
         CoordinatorNode node = new CoordinatorNode(workerId, "localhost", port,
                 membership, rpc, config);
         nodes.add(node);

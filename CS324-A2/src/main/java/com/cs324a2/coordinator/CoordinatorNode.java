@@ -28,7 +28,6 @@ import io.grpc.Server;
 import io.grpc.ServerBuilder;
 import io.grpc.Status;
 import io.grpc.StatusRuntimeException;
-import io.grpc.stub.ServerCallStreamObserver;
 import io.grpc.stub.StreamObserver;
 
 import java.io.IOException;
@@ -605,14 +604,10 @@ public final class CoordinatorNode implements AutoCloseable {
             return;
         }
         String jobId = request.getJobId();
-        ServerCallStreamObserver<JobProgressUpdate> serverObserver =
-                (observer instanceof ServerCallStreamObserver<?> raw)
-                        ? (ServerCallStreamObserver<JobProgressUpdate>) raw : null;
         long lastSentProgress = -1;
         try {
             while (!closed.get()) {
                 if (Context.current().isCancelled()) return;
-                if (serverObserver != null && serverObserver.isCancelled()) return;
                 ReplicatedJobStore.JobRecord record = store.get(jobId);
                 if (record == null) {
                     Thread.sleep(50);

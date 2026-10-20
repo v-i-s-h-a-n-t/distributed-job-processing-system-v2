@@ -30,7 +30,7 @@ class BootstrapGrpcServiceTest {
 
     @BeforeEach
     void startServer() throws Exception {
-        service = new BootstrapGrpcService(600, 30);
+        service = new BootstrapGrpcService(5_000, 30);
         String serverName = InProcessServerBuilder.generateName();
         server = InProcessServerBuilder.forName(serverName)
                 .directExecutor()
@@ -148,6 +148,8 @@ class BootstrapGrpcServiceTest {
 
     @Test
     void missedHeartbeatsExpireAndPublishWorkerLeft() throws Exception {
+        stopServer();
+        startShortLeaseServer();
         BlockingQueue<MembershipEvent> events = new LinkedBlockingQueue<>();
         BlockingQueue<Throwable> errors = new LinkedBlockingQueue<>();
         BootstrapClient.WatchHandle watch = client.watchMembership(0,
@@ -167,6 +169,15 @@ class BootstrapGrpcServiceTest {
         } finally {
             watch.cancel();
         }
+    }
+
+    private void startShortLeaseServer() throws Exception {
+        service = new BootstrapGrpcService(600, 30);
+        String serverName = InProcessServerBuilder.generateName();
+        server = InProcessServerBuilder.forName(serverName).directExecutor()
+                .addService(service).build().start();
+        client = new BootstrapClient(InProcessChannelBuilder.forName(serverName)
+                .directExecutor().build());
     }
 
     private static StreamObserver<MembershipEvent> queueingObserver(
