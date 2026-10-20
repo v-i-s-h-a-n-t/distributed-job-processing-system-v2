@@ -25,11 +25,7 @@ import java.util.concurrent.TimeUnit;
 import org.junit.jupiter.api.AfterEach;
 import org.junit.jupiter.api.Test;
 
-/**
- * End-to-end test of the exact path the GUI uses: gRPC Bootstrap discovery,
- * coordinator {@code SubmitJob} with leader-hint following, and
- * server-streaming {@code SubscribeJobProgress} with failover.
- */
+/** End-to-end: GUI path of discovery, submit with leader hints, and progress streaming. */
 class GrpcClientServiceTest {
     private Server bootstrapServer;
     private BootstrapGrpcService bootstrapService;
@@ -44,28 +40,24 @@ class GrpcClientServiceTest {
             try {
                 node.close();
             } catch (RuntimeException ignored) {
-                // Best effort.
             }
         }
         for (BootstrapWorkerMembership membership : memberships) {
             try {
                 membership.close();
             } catch (RuntimeException ignored) {
-                // Best effort.
             }
         }
         for (WorkerHeartbeat heartbeat : heartbeats) {
             try {
                 heartbeat.close();
             } catch (RuntimeException ignored) {
-                // Best effort.
             }
         }
         for (GrpcWorkerRpcClient client : taskClients) {
             try {
                 client.close();
             } catch (RuntimeException ignored) {
-                // Best effort.
             }
         }
         if (bootstrapServer != null) bootstrapServer.shutdownNow();
@@ -73,7 +65,6 @@ class GrpcClientServiceTest {
             try {
                 bootstrapService.close();
             } catch (RuntimeException ignored) {
-                // Best effort.
             }
         }
     }
@@ -104,7 +95,7 @@ class GrpcClientServiceTest {
             node.start();
         }
 
-        // Wait for full membership convergence on every node.
+        // wait for membership convergence on every node
         long deadline = System.currentTimeMillis() + 20_000;
         while (System.currentTimeMillis() < deadline) {
             boolean ready = memberships.stream()
@@ -119,7 +110,7 @@ class GrpcClientServiceTest {
         assertEquals(0, nodes.stream().filter(CoordinatorNode::isLeader).count(),
                 "no election should run before the first job");
 
-        // The GUI path: discovery + submit + streaming, all over gRPC.
+        // discovery + submit + streaming, all over gRPC
         try (GrpcClientService gui = new GrpcClientService("localhost", bootstrapPort)) {
             assertEquals(3, gui.listWorkers().size());
             assertTrue(gui.isAvailable());
@@ -163,8 +154,7 @@ class GrpcClientServiceTest {
             assertTrue(fetched.getWorkerBreakdownCount() > 0);
             assertEquals(fetched.getTotalTasks(), fetched.getCompletedTasks());
         }
-        // Coordinator-to-client path also works when the GUI talks to a follower
-        // first: covered implicitly because submit() tries endpoints in order.
+        // follower-first path is covered because submit() tries endpoints in order
         CompletableFuture<Long> later;
         try (GrpcClientService gui = new GrpcClientService("localhost", bootstrapPort)) {
             later = CompletableFuture.supplyAsync(() -> {
@@ -175,7 +165,7 @@ class GrpcClientServiceTest {
                 }
             });
             assertEquals(77L, later.get(60, TimeUnit.SECONDS));
-            // Six submissions overlap and cross the five-admission boundary.
+            // concurrent submissions cross the five-admission boundary
             List<CompletableFuture<Long>> concurrent = new ArrayList<>();
             for (int i = 3; i <= 8; i++) {
                 String jobId = "gui-term-job-" + i;

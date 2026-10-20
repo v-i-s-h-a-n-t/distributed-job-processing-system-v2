@@ -3,19 +3,8 @@ package com.cs324a2.client;
 import javax.swing.SpinnerNumberModel;
 
 /**
- * Exactly 64-bit spinner model for PRIMESUM bounds and other large values.
- *
- * <p>{@link SpinnerNumberModel}'s public constructor only has a special case
- * for {@link Integer}; every other argument combination — including all
- * {@code Long}s — falls through to a {@link Double}-backed model. That silently
- * corrupts large range bounds: {@code 9007199254740993} (2^53+1) is stored as
- * {@code 9007199254740992}, {@code Long.MAX_VALUE} renders as
- * {@code 9223372036854776000}, and clamping compares {@code doubleValue()}s.
- * The GUI would then submit a different range than the user typed.
- *
- * <p>This subclass keeps an exact {@code long} and stays a
- * {@code SpinnerNumberModel} so {@link javax.swing.JSpinner.NumberEditor} (and
- * therefore {@code commitEdit()}) keeps working.
+ * Spinner model that holds an exact long. SpinnerNumberModel falls back to
+ * Double for Long args, which loses precision on large values.
  */
 public final class LongSpinnerModel extends SpinnerNumberModel {
 
@@ -25,9 +14,7 @@ public final class LongSpinnerModel extends SpinnerNumberModel {
     private long exact;
 
     public LongSpinnerModel(long value, long min, long max, long step) {
-        // Super is invoked purely so NumberEditor accepts this model; all
-        // behaviour is overridden below, so its internal (Integer) state is
-        // never consulted.
+        // dummy super so NumberEditor accepts this model
         super(0, Integer.MIN_VALUE, Integer.MAX_VALUE, 1);
         if (step <= 0) {
             throw new IllegalArgumentException("step must be positive");

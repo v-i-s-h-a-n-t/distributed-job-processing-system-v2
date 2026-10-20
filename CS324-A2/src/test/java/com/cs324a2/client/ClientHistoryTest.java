@@ -11,11 +11,7 @@ import java.util.concurrent.atomic.AtomicBoolean;
 import javax.swing.table.DefaultTableModel;
 import org.junit.jupiter.api.Test;
 
-/**
- * Headless checks for history clearing: terminal rows go away with their
- * progress state and stream handles, RUNNING rows (and their live streams)
- * are untouched.
- */
+/** History clearing: terminal rows go away, RUNNING rows and streams stay. */
 class ClientHistoryTest {
 
     @Test
@@ -65,9 +61,7 @@ class ClientHistoryTest {
 
     @Test
     void completedJobIsNormalisedToFullProgress() {
-        // A job can finish before the terminal stream update is delivered (the
-        // submit returns first). The bar must not stay frozen at the last
-        // mid-flight percentage.
+        // submit can finish before the terminal stream update; bar must not stick
         JobProgressUpdate midFlight = JobProgressUpdate.newBuilder()
                 .setJobId("j").setTotalTasks(12).setCompletedTasks(8)
                 .setRunningTasks(4).setPendingTasks(0)
@@ -80,7 +74,7 @@ class ClientHistoryTest {
         assertEquals(0, done.getPendingTasks());
         assertEquals(1.0, done.getCompletionFraction(), 1e-9);
         assertEquals(com.cs324a2.grpc.coordinator.JobStatus.JOB_COMPLETED, done.getStatus());
-        // Real totals are preserved, not fabricated.
+        // real totals preserved
         assertEquals(12, done.getTotalTasks());
         assertEquals("j", done.getJobId());
     }

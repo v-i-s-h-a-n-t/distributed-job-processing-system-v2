@@ -16,11 +16,7 @@ import java.util.Iterator;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.TimeUnit;
 
-/**
- * Low-level gRPC client for coordinator nodes. Channels are cached per
- * host:port. Supports blocking job submission and both async and blocking
- * progress streaming.
- */
+/** Low-level gRPC client for coordinator nodes. Channels cached per host:port. */
 public final class CoordinatorGrpcClient implements AutoCloseable {
     private final ConcurrentHashMap<String, ManagedChannel> channels = new ConcurrentHashMap<>();
     private volatile boolean closed;
@@ -38,7 +34,7 @@ public final class CoordinatorGrpcClient implements AutoCloseable {
         return stub.submitJob(CoordinatorJobRequest.newBuilder().setJob(job).build());
     }
 
-    /** Async server-streaming subscribe; caller gets a handle to cancel. */
+    /** Async streaming subscribe; returns a handle to cancel. */
     public WatchHandle subscribe(String host, int port, String jobId,
                                  StreamObserver<JobProgressUpdate> delegate) {
         if (closed) throw new IllegalStateException("coordinator gRPC client is closed");
@@ -82,13 +78,12 @@ public final class CoordinatorGrpcClient implements AutoCloseable {
                 try {
                     call.cancel("progress watch cancelled", null);
                 } catch (RuntimeException ignored) {
-                    // Best effort.
                 }
             }
         };
     }
 
-    /** Blocking iterator variant used for failover loops across endpoints. */
+    /** Blocking iterator; used by failover loops. */
     public Iterator<JobProgressUpdate> subscribeBlocking(String host, int port, String jobId) {
         if (closed) throw new IllegalStateException("coordinator gRPC client is closed");
         return CoordinatorServiceGrpc.newBlockingStub(channelFor(host, port))
@@ -102,7 +97,7 @@ public final class CoordinatorGrpcClient implements AutoCloseable {
                 .getCoordinatorState(GetCoordinatorStateRequest.getDefaultInstance());
     }
 
-    /** Converts a domain job to its wire spec (mirrors CoordinatorJobMapper). */
+    /** Converts a JobRequest to its wire spec. */
     public static JobSpec toSpec(com.cs324a2.common.JobRequest request) {
         JobSpec.Builder builder = JobSpec.newBuilder()
                 .setJobId(request.jobId());
@@ -120,7 +115,7 @@ public final class CoordinatorGrpcClient implements AutoCloseable {
         return builder.build();
     }
 
-    /** Resolves a usable host:port for an endpoint (null host means unreachable). */
+    /** True if the endpoint has a usable host and port. */
     public static boolean isReachable(WorkerEndpoint endpoint) {
         return endpoint != null
                 && endpoint.getHost() != null && !endpoint.getHost().isBlank()
@@ -134,7 +129,6 @@ public final class CoordinatorGrpcClient implements AutoCloseable {
             try {
                 channel.shutdownNow();
             } catch (RuntimeException ignored) {
-                // Best effort during shutdown.
             }
         }
         channels.clear();

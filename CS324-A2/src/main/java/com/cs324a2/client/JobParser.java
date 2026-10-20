@@ -6,11 +6,8 @@ import java.util.ArrayList;
 import java.util.List;
 
 /**
- * Parses manual text entry and CSV files into job inputs.
- *
- * <p>List jobs (MAX, PRIMECOUNT) accept comma/whitespace/newline separated
- * integers, with an optional single header row (e.g. {@code value}).
- * Range jobs (PRIMESUM) need {@code start,end}.
+ * Parses manual text and CSV files into job inputs. List jobs take
+ * comma/whitespace separated ints (optional header); PRIMESUM takes start,end.
  */
 public final class JobParser {
 
@@ -40,10 +37,7 @@ public final class JobParser {
         return List.copyOf(numbers);
     }
 
-    /**
-     * Loads a numbers CSV. Accepts single-column (one int per line, optional
-     * header) or single/multiple comma-separated values per line.
-     */
+    /** Load numbers from a CSV. Single column or comma-separated, optional header. */
     public static List<Integer> loadNumberList(File file) throws IOException {
         List<Integer> numbers = new ArrayList<>();
         try (BufferedReader reader = new BufferedReader(new FileReader(file))) {
@@ -54,11 +48,10 @@ public final class JobParser {
                 if (line.isEmpty() || line.startsWith("#")) {
                     continue;
                 }
-                // Skip a single header row like "value" or "numbers".
+                // skip one header row like "value" or "numbers"
                 if (firstLine && line.matches("(?i)[a-z_]+.*") && !line.matches("-?\\d.*")) {
                     firstLine = false;
-                    // If the header line itself contains digits, fall through;
-                    // otherwise skip it.
+                    // header with digits: fall through and try to parse
                     if (!line.matches(".*\\d.*")) {
                         continue;
                     }
@@ -82,7 +75,7 @@ public final class JobParser {
         return List.copyOf(numbers);
     }
 
-    /** Loads a PRIMESUM range. Accepts "start,end" (single row, header optional). */
+    /** Load a PRIMESUM range from "start,end" (single row, header optional). */
     public static long[] loadPrimeSumRange(File file) throws IOException {
         try (BufferedReader reader = new BufferedReader(new FileReader(file))) {
             String line;

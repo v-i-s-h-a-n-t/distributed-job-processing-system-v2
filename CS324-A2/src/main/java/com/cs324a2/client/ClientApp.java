@@ -127,15 +127,12 @@ public class ClientApp extends JFrame {
         }
     };
     private final JTable table = new JTable(tableModel);
-    /**
-     * Latest streamed progress per job, keyed by job ID (not row index) so
-     * history rows can be cleared while other jobs are still running.
-     */
+    /** Latest progress per job, keyed by job ID so cleared rows don't break running jobs. */
     private final Map<String, JobProgressUpdate> progressByJob = new ConcurrentHashMap<>();
-    /** Active progress-stream handles per job, cancelled on completion/dispose. */
+    /** Progress stream handles per job. */
     private final Map<String, GrpcClientService.ProgressHandle> progressHandles =
             new ConcurrentHashMap<>();
-    /** Completion can race subscription-handle publication on the stream thread. */
+    /** Jobs whose progress stream already finished. */
     private final java.util.Set<String> finishedProgressStreams =
             ConcurrentHashMap.newKeySet();
     private final java.util.Set<String> progressFetches = ConcurrentHashMap.newKeySet();
@@ -251,9 +248,7 @@ public class ClientApp extends JFrame {
     }
 
     private void styleSpinner(JSpinner spinner) {
-        // Pattern "0" (no grouping element) renders the typed digits verbatim:
-        // large bounds must never appear as "1,000,000,000,000" or, worse, be
-        // rounded through a double.
+        // "0" format: no thousands separators, exact digits
         JSpinner.NumberEditor editor = new JSpinner.NumberEditor(spinner, "0");
         spinner.setEditor(editor);
         spinner.setBackground(SURFACE);
@@ -503,14 +498,7 @@ public class ClientApp extends JFrame {
         return new FlatButton(text, primary);
     }
 
-    /**
-     * Width that actually fits a button's own text, including the insets the
-     * look and feel adds around it.
-     *
-     * <p>A fixed width clipped the label ("Clear finish…") on desktops whose
-     * configured font is much larger than the one the size was picked for, and
-     * text width alone still fell short because of the button's insets.
-     */
+    /** Button width that fits its text plus insets. */
     private static int fittedWidth(JButton button, String text) {
         java.awt.image.BufferedImage probe =
                 new java.awt.image.BufferedImage(1, 1, java.awt.image.BufferedImage.TYPE_INT_ARGB);
@@ -545,9 +533,7 @@ public class ClientApp extends JFrame {
 
     private void refreshWorkerCount() {
         if (!workerPollInProgress.compareAndSet(false, true)) return;
-        // Read the connection fields on the EDT (this method runs on it): the
-        // port spinner may hold typed-but-uncommitted text, so flush it here
-        // rather than touching Swing state from the pool thread below.
+        // read host/port on the EDT; spinner may have uncommitted text
         final String host;
         final int port;
         try {
@@ -602,25 +588,21 @@ public class ClientApp extends JFrame {
         return readPort();
     }
 
-    /** Flushes the port editor and validates as a long before narrowing to int. */
+    /** Commit the editor and read the port as int. */
     private int readPort() {
         return toPort(commitAndReadLong(portField, "port"));
     }
 
-    /** Raw editor text for a spinner, or null when it has no text editor. */
+    /** Raw editor text, or null if no text editor. */
     static String editorText(JSpinner spinner) {
         return (spinner.getEditor() instanceof JSpinner.DefaultEditor defaultEditor)
                 ? defaultEditor.getTextField().getText() : null;
     }
 
     /**
-     * Reads a spinner exactly in 64-bit space. The typed text is parsed with
-     * {@link Long#parseLong} first, because {@code commitEdit()} alone goes
-     * through {@code NumberEditor}'s lenient {@code NumberFormat} parser, which
-     * accepts {@code "12x"} as {@code 12} and clamps out-of-range input (e.g.
-     * 23 digits) to {@link Long#MAX_VALUE} without telling the user. The parsed
-     * value is then committed and verified so the model cannot disagree with
-     * the digits the user entered. Must be called on the EDT.
+     * Parse the spinner text as a long directly, then commit. NumberEditor's
+     * format parser is lenient ("12x" -> 12) and clamps huge values, so we
+     * don't trust it alone. Call on the EDT.
      */
     static long commitAndReadLong(JSpinner spinner, String label) {
         String text = editorText(spinner);
@@ -648,7 +630,7 @@ public class ClientApp extends JFrame {
         return parsed;
     }
 
-    /** Validates a connection port in 64-bit space, then narrows to {@code int}. */
+    /** Validate port range, then cast to int. */
     static int toPort(long port) {
         if (port < 1 || port > 65_535) {
             throw new IllegalArgumentException("port must be between 1 and 65535");
@@ -705,8 +687,7 @@ public class ClientApp extends JFrame {
         String inputSummary;
         try {
             if (op == ComputeOperation.PRIMESUM) {
-                // Flush typed-but-uncommitted editor text, read as longs, and
-                // validate the inclusive range before building the request.
+                // read start/end as longs before building the request
                 long start = commitAndReadLong(startField, "start");
                 long end = commitAndReadLong(endField, "end");
                 JobRequest.checkRangeSpan(start, end);
@@ -748,23 +729,18 @@ public class ClientApp extends JFrame {
                                                 SwingUtilities.invokeLater(
                                                         () -> updateProgress(jobId, update));
                                                 if (update.getStatus() != JobStatus.JOB_ACTIVE) {
-                                                    // Terminal checkpoint seen: drop the
-                                                    // handle so the stream's own
-                                                    // completion cleans it up.
+                                                    // terminal update; drop handle
                                                     finishProgressStream(jobId);
                                                 }
                                             }
 
                                             @Override
                                             public void onError(Throwable error) {
-                                                // Keep the submit's own outcome as the
-                                                // source of truth; progress simply stops.
+                                                // submit outcome is the source of truth
                                                 finishProgressStream(jobId);
                                             }
                                         });
-                        // The stream may emit a terminal event (or fail) before
-                        // subscribeProgress returns. Publish then recheck so an
-                        // early cleanup cannot leave a stale handle in the map.
+                        // recheck: stream may finish before put() returns
                         progressHandles.put(jobId, handle);
                         if (finishedProgressStreams.remove(jobId)) {
                             releaseStream(jobId);
@@ -772,9 +748,6 @@ public class ClientApp extends JFrame {
                         try {
                             return grpc.submitExact(request);
                         } finally {
-                            // The progress stream has its own gRPC client and must
-                            // remain open after SubmitJob returns so the terminal
-                            // checkpoint and worker breakdown reach the GUI.
                             grpc.close();
                         }
                     } catch (Exception e) {
@@ -782,7 +755,6 @@ public class ClientApp extends JFrame {
                         try {
                             grpc.close();
                         } catch (RuntimeException ignored) {
-                            // Best effort.
                         }
                         throw new RuntimeException(e);
                     }
@@ -818,7 +790,7 @@ public class ClientApp extends JFrame {
         progressByJob.remove(jobId);
     }
 
-    /** Finds a job's current row by ID. Returns -1 when cleared. Call on the EDT. */
+    /** Find row by job ID, -1 if not found. Call on the EDT. */
     private int findRow(String jobId) {
         for (int row = 0; row < tableModel.getRowCount(); row++) {
             if (jobId.equals(String.valueOf(tableModel.getValueAt(row, 0)))) return row;
@@ -826,14 +798,13 @@ public class ClientApp extends JFrame {
         return -1;
     }
 
-    /** Drops and cancels a job's progress stream handle exactly once. */
+    /** Cancel and remove a job's progress stream handle (once). */
     private void releaseStream(String jobId) {
         GrpcClientService.ProgressHandle handle = progressHandles.remove(jobId);
         if (handle != null) {
             try {
                 handle.cancel();
             } catch (RuntimeException ignored) {
-                // Best effort.
             }
         }
     }
@@ -841,7 +812,7 @@ public class ClientApp extends JFrame {
     private void finishProgressStream(String jobId) {
         GrpcClientService.ProgressHandle handle = progressHandles.remove(jobId);
         if (handle == null) {
-            // The callback can beat subscribeProgress() returning its handle.
+            // callback beat subscribeProgress returning the handle
             finishedProgressStreams.add(jobId);
             return;
         }
@@ -849,19 +820,16 @@ public class ClientApp extends JFrame {
         try {
             handle.cancel();
         } catch (RuntimeException ignored) {
-            // Best effort.
         }
     }
 
-    /** Applies one streamed update: percent from actual completed tasks. */
+    /** Apply one streamed update: percent from completed tasks. */
     void updateProgress(String jobId, JobProgressUpdate update) {
         if (update == null) return;
         int row = findRow(jobId);
         if (row < 0) return; // cleared from history; nothing to paint
         if ("DONE".equals(String.valueOf(tableModel.getValueAt(row, COL_STATUS)))) {
-            // SubmitJob can finish before the EDT handles the first streamed
-            // update. Keep its task snapshot for the breakdown while leaving
-            // the finished bar at 100%.
+            // job already done; keep snapshot for breakdown, bar stays 100%
             progressByJob.compute(jobId, (id, last) ->
                     progressForFinishedJob(last, update));
             table.repaint();
@@ -882,10 +850,7 @@ public class ClientApp extends JFrame {
             if (!"DONE".equals(status)) {
                 return;
             }
-            // A finished job is 100% by definition. The terminal streamed update
-            // can be lost to the race between submit() returning and the stream
-            // being cancelled, so normalise here rather than leaving the bar
-            // frozen at the last mid-flight percentage (e.g. 67% forever).
+            // finished job is 100%; terminal update may have been lost to the race
             tableModel.setValueAt(100, row, COL_PROGRESS);
             progressByJob.compute(jobId, (id, last) ->
                     last == null ? null : asCompleted(last));
@@ -893,7 +858,7 @@ public class ClientApp extends JFrame {
         });
     }
 
-    /** Recover the final task snapshot if the stream missed a very short job. */
+    /** Fetch final task snapshot if the stream missed a short job. */
     private void loadMissingProgress(String jobId) {
         if (!progressFetches.add(jobId)) return;
         String host = grpcHost();
@@ -906,7 +871,7 @@ public class ClientApp extends JFrame {
                         SwingUtilities.invokeLater(() -> updateProgress(jobId, checkpoint));
                     }
                 } catch (RuntimeException ignored) {
-                    // The live stream may still deliver the checkpoint.
+                    // stream may still deliver the checkpoint
                 } finally {
                     progressFetches.remove(jobId);
                 }
@@ -917,9 +882,8 @@ public class ClientApp extends JFrame {
     }
 
     /**
-     * Marks a checkpoint as fully completed, keeping its real task totals. Used
-     * when the client learns the job finished before the terminal stream update
-     * arrived, so the bar, tooltip, and breakdown dialog stay consistent.
+     * Mark a checkpoint as completed, keeping real task totals. Used when
+     * we learn the job finished before the terminal stream update arrived.
      */
     static JobProgressUpdate asCompleted(JobProgressUpdate last) {
         int total = last.getTotalTasks();
@@ -938,18 +902,15 @@ public class ClientApp extends JFrame {
         return update.getStatus() == JobStatus.JOB_COMPLETED ? update : asCompleted(update);
     }
 
-    /** Removes DONE/FAILED rows; RUNNING rows (and their live streams) are kept. */
+    /** Remove DONE/FAILED rows; RUNNING rows and their streams are kept. */
     private void clearFinishedJobs() {
         int removed = removeFinishedRows(tableModel, progressByJob, progressHandles);
         if (removed > 0) updateRunning();
     }
 
     /**
-     * Drops terminal rows from the model plus their progress state and stream
-     * handles. Pure table/map surgery (no frame needed), so it is unit
-     * testable headless. Must be called on the EDT in production: live
-     * writers resolve rows by job ID at paint time, so running jobs are
-     * unaffected by the removal.
+     * Remove terminal rows and their progress state/stream handles.
+     * Headless-friendly for tests. Call on the EDT in production.
      *
      * @return number of rows removed
      */
@@ -970,7 +931,6 @@ public class ClientApp extends JFrame {
                 try {
                     handle.cancel();
                 } catch (RuntimeException ignored) {
-                    // Best effort.
                 }
             }
         }
@@ -981,9 +941,8 @@ public class ClientApp extends JFrame {
     }
 
     /**
-     * Worker-level breakdown for one job. Click the Progress cell to open it.
-     * Shows per-worker rollups plus per-task detail from the latest streamed
-     * checkpoint; refreshes live while the stream advances.
+     * Worker-level breakdown for one job. Click the Progress cell to open.
+     * Refreshes live while the stream advances.
      */
     private void showBreakdown(int modelRow) {
         if (modelRow < 0 || modelRow >= tableModel.getRowCount()) return;
@@ -1090,7 +1049,7 @@ public class ClientApp extends JFrame {
             if (!dialog.isVisible()) return;
             refresh.run();
             if (findRow(jobId) < 0) {
-                // History row was cleared: freeze on the last snapshot.
+                // row was cleared; freeze on last snapshot
                 summary.setText(summary.getText() + " · cleared from history");
                 Timer t = refresherRef.get();
                 if (t != null) t.stop();
@@ -1119,7 +1078,6 @@ public class ClientApp extends JFrame {
             try {
                 handle.cancel();
             } catch (RuntimeException ignored) {
-                // Best effort.
             }
         }
         progressHandles.clear();
@@ -1246,11 +1204,7 @@ public class ClientApp extends JFrame {
         }
     }
 
-    /**
-     * Determinate progress bar for the Progress column. Values are Integer
-     * 0-100 from streamed checkpoints. The cell tooltip invites the click-through
-     * to the worker breakdown.
-     */
+    /** Progress bar renderer for the Progress column (0-100). */
     private final class ProgressRenderer extends JProgressBar implements TableCellRenderer {
         private ProgressRenderer() {
             super(0, 100);

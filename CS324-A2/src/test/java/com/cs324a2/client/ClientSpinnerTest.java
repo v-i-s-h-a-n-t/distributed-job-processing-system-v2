@@ -7,13 +7,7 @@ import javax.swing.JSpinner;
 import javax.swing.SpinnerNumberModel;
 import org.junit.jupiter.api.Test;
 
-/**
- * Headless-safe checks for the GUI's spinner plumbing: typed-but-uncommitted
- * editor text must be flushed via {@code commitEdit()}, values are read as
- * {@code long} (never an {@code (Integer)} cast), ports are bounds-checked
- * before narrowing to {@code int}, and 64-bit bounds are never silently
- * corrupted by a double round-trip.
- */
+/** Spinner plumbing: commit pending text, exact longs, port bounds. */
 class ClientSpinnerTest {
 
     private static JSpinner longSpinner(long value) {
@@ -34,9 +28,9 @@ class ClientSpinnerTest {
         JSpinner.NumberEditor editor = new JSpinner.NumberEditor(spinner, "0");
         spinner.setEditor(editor);
         editor.getTextField().setText("4242");
-        // No Enter pressed: getValue() still holds the old model value ...
+        // not committed yet; getValue still old
         assertEquals(1L, ((Number) spinner.getValue()).longValue());
-        // ... but the helper commits the pending edit first.
+        // helper commits the pending edit first
         assertEquals(4242L, ClientApp.commitAndReadLong(spinner, "start"));
     }
 
@@ -61,7 +55,7 @@ class ClientSpinnerTest {
 
     @Test
     void largeRangeBoundsRoundTripExactly() {
-        // A double-backed spinner silently corrupts all of these.
+        // double-backed spinner corrupts these
         long[] exact = {
             100_000_000L,
             100_000_000_000_000L,
@@ -83,7 +77,7 @@ class ClientSpinnerTest {
 
     @Test
     void rejectsTrailingGarbageThatLenientParserWouldAccept() {
-        // NumberEditor parses "12x" as 12; that must not silently shrink a bound.
+        // NumberEditor would accept "12x" as 12
         JSpinner spinner = longSpinner(1L);
         type(spinner, "12x");
         assertThrows(IllegalArgumentException.class,
@@ -92,7 +86,7 @@ class ClientSpinnerTest {
 
     @Test
     void rejectsInputBeyond64BitsInsteadOfClampingToMaxValue() {
-        // 23 digits used to clamp silently to Long.MAX_VALUE.
+        // 23 digits used to clamp to Long.MAX_VALUE silently
         JSpinner spinner = longSpinner(1L);
         type(spinner, "99999999999999999999999");
         assertThrows(IllegalArgumentException.class,
@@ -101,9 +95,7 @@ class ClientSpinnerTest {
 
     @Test
     void longValuedPortIsBoundsCheckedInsteadOfClassCast() {
-        // commitEdit() on the Integer-based port model can leave a Long behind
-        // (e.g. after typing a huge number); an (Integer) cast would throw
-        // ClassCastException instead of a validation error.
+        // commitEdit can leave a Long on the Integer port model; cast would CCE
         JSpinner port = new JSpinner(new SpinnerNumberModel(1099, 1, 65535, 1));
         port.setValue(70_000L);
         assertThrows(IllegalArgumentException.class,

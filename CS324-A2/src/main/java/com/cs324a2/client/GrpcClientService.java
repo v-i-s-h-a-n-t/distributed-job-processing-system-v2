@@ -21,15 +21,7 @@ import java.util.Map;
 import java.util.HashMap;
 import java.util.concurrent.atomic.AtomicBoolean;
 
-/**
- * High-level gRPC facade used by the Swing client.
- *
- * <p>Discovery goes through the gRPC Bootstrap ({@code ListWorkers}); job
- * submission goes to coordinator nodes ({@code SubmitJob}) following leader
- * hints; progress arrives via server-streaming
- * ({@code SubscribeJobProgress}) with failover across endpoints so a
- * coordinator crash mid-job does not kill the client's progress view.
- */
+/** gRPC client used by the Swing client for discovery, submit, and progress. */
 public final class GrpcClientService implements AutoCloseable {
     private static final long SUBMIT_TIMEOUT_MILLIS = 120_000;
 
@@ -49,15 +41,13 @@ public final class GrpcClientService implements AutoCloseable {
         this.bootstrapPort = bootstrapPort;
     }
 
-    /** Lists live coordinator/worker endpoints via gRPC Bootstrap. */
     public List<WorkerEndpoint> listWorkers() {
         try (BootstrapClient client = new BootstrapClient(bootstrapHost, bootstrapPort)) {
-            // listWorkers() already applies a ~2s deadline internally.
             return client.listWorkers().activeWorkers();
         }
     }
 
-    /** Checks whether the gRPC Bootstrap is reachable. */
+    /** True if bootstrap is reachable. */
     public boolean isAvailable() {
         try {
             listWorkers();
@@ -67,7 +57,7 @@ public final class GrpcClientService implements AutoCloseable {
         }
     }
 
-    /** Reads a retained checkpoint when a fast job outruns its progress stream. */
+    /** Reads checkpoint state when a fast job outruns its progress stream. */
     public JobProgressUpdate fetchJobProgress(String jobId) {
         try (CoordinatorGrpcClient reader = new CoordinatorGrpcClient()) {
             for (WorkerEndpoint endpoint : ordered(listWorkers())) {
@@ -80,7 +70,7 @@ public final class GrpcClientService implements AutoCloseable {
                         }
                     }
                 } catch (RuntimeException ignored) {
-                    // A task-only or unavailable worker cannot serve coordinator state.
+                    // task-only worker, no coordinator state
                 }
             }
         }
@@ -122,12 +112,12 @@ public final class GrpcClientService implements AutoCloseable {
         return update.build();
     }
 
-    /** Submits a job through gRPC, following NOT_LEADER hints. */
+    /** Submits via gRPC, following NOT_LEADER hints. */
     public long submit(JobRequest request) throws Exception {
         return Long.parseLong(submitExact(request));
     }
 
-    /** Returns the exact decimal result, including sums outside signed 64-bit. */
+    /** Exact decimal result, may exceed signed 64-bit. */
     public String submitExact(JobRequest request) throws Exception {
         while (!closed && !Thread.currentThread().isInterrupted()) {
             try {
@@ -145,7 +135,7 @@ public final class GrpcClientService implements AutoCloseable {
                                 : terminal.getExactResultValue();
                     }
                 } catch (StatusRuntimeException ignored) {
-                    // Bootstrap or coordinators may still be recovering.
+                    // still recovering
                 }
                 Thread.sleep(500);
             }
@@ -157,9 +147,7 @@ public final class GrpcClientService implements AutoCloseable {
         return error.getStatus().getCode() == Status.Code.UNAVAILABLE
                 || error.getStatus().getCode() == Status.Code.DEADLINE_EXCEEDED
                 || error.getStatus().getCode() == Status.Code.CANCELLED
-                // A coordinator can disappear while its SubmitJob handler is
-                // running. gRPC may surface that interrupted handler as UNKNOWN
-                // rather than UNAVAILABLE; the job ID makes resubmission safe.
+                // interrupted SubmitJob can surface as UNKNOWN; job ID makes retry safe
                 || error.getStatus().getCode() == Status.Code.UNKNOWN;
     }
 
@@ -174,7 +162,7 @@ public final class GrpcClientService implements AutoCloseable {
         long submitTimeout = request.operation() == ComputeOperation.PRIMESUM
                 ? 0 : SUBMIT_TIMEOUT_MILLIS;
         StatusRuntimeException lastFailure = null;
-        // First pass: try every reachable endpoint in order.
+        // first pass: every reachable endpoint
         String hintHost = null;
         int hintPort = -1;
         for (WorkerEndpoint endpoint : endpoints) {
@@ -202,7 +190,7 @@ public final class GrpcClientService implements AutoCloseable {
                 lastFailure = e;
             }
         }
-        // Second pass: follow the leader hint if one was offered.
+        // second pass: leader hint
         if (hintHost != null) {
             try {
                 CoordinatorJobResponse response = coordinators.submit(
@@ -229,11 +217,8 @@ public final class GrpcClientService implements AutoCloseable {
     }
 
     /**
-     * Streams real-time progress for {@code jobId}. The subscription survives
-     * coordinator failover by roaming across endpoints: followers serve their
-     * replicated snapshot, so killing the leader mid-job does not end the
-     * stream. Updates stop on terminal state or
-     * {@link ProgressHandle#cancel()}.
+     * Streams progress for a job. Roams endpoints on failover so a
+     * coordinator crash doesn't kill the stream.
      */
     public ProgressHandle subscribeProgress(String jobId, ProgressListener listener) {
         if (jobId == null || jobId.isBlank()) {
@@ -252,7 +237,6 @@ public final class GrpcClientService implements AutoCloseable {
             try {
                 streamClient.close();
             } catch (RuntimeException ignored) {
-                // Best effort.
             }
         };
     }
@@ -308,7 +292,6 @@ public final class GrpcClientService implements AutoCloseable {
         try {
             client.close();
         } catch (RuntimeException ignored) {
-            // Best effort.
         }
     }
 
@@ -318,11 +301,10 @@ public final class GrpcClientService implements AutoCloseable {
         try {
             coordinators.close();
         } catch (RuntimeException ignored) {
-            // Best effort.
         }
     }
 
-    /** Listener for streamed progress updates (invoked off the EDT). */
+    /** Progress stream callback (invoked off the EDT). */
     public interface ProgressListener {
         void onUpdate(JobProgressUpdate update);
         default void onError(Throwable error) {}
@@ -334,7 +316,7 @@ public final class GrpcClientService implements AutoCloseable {
         void cancel();
     }
 
-    /** Checked failure carrying the coordinator's terminal error string. */
+    /** Job failed with the coordinator's error string. */
     public static final class JobFailedException extends Exception {
         JobFailedException(String message) {
             super(message);
